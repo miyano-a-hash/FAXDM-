@@ -41,6 +41,24 @@ from openpyxl.worksheet.datavalidation import DataValidation
 DRIVE_FOLDER_ID = "1NVYeVYTyNCW6fLL76pum7MU9cxjvAs-b"
 FAXDM_SHEET_ID = "1jqFSHwmtZRYmTlx76Bm2SlTPwAoI8MNctiFNXudW13o"
 
+# 月別マスタのスプレッドシート（名前 → ID）。新しい月ができたら1行追加してください。
+# ID は URL の https://docs.google.com/spreadsheets/d/【ここ】/edit の部分です。
+# ※ どのシートも共有設定を「リンクを知っている全員」が「閲覧者」にしておく必要があります。
+MASTER_SHEETS = {
+    "2601_やどかり": "1f6YNPxMnES1N1xAjt5ZZR5JmpUSIcGkR5lT6MZcAjNc",
+    "2602_やどかり": "1P_6EQ_sEUWBxt5T7uyXx_tIzqjSYLOoYoGtHfzadqIY",
+    "2603_やどかり": "1Ek0E9p11eMmHxhq0s_VsrcW3MjLV3aWbWvglHj8_Elo",
+    "2604_やどかり": "1eTdNQUTIM-mQOqAh5hjRdcLIorhPH8r5xGfxuOqbEqs",
+    "2605_やどかり": "1FQjoeok9M7aR82ybyaCEZLO4x1x16H4pov7YP9e_NnY",
+    "2606_やどかり": "1UvB4Ix7Ewj32RUo37nohhmozqPzzmXzAXoAO6bvQ1Bw",
+    "2607_やどかり": "1ZPRkSi2wo0LSO7v7rmo32e2Yao4bEj9ofcHFeY4W8cE",
+    "2608_やどかり": "1KSxFK-1PN_7JSD-FL8SKOpJiZ2d_UpnKB99MGArjWbo",
+    "2609_やどかり": "1GQnzGk5H9mETyDJwrZoxs6sMPZa1F54UTdy5rJcK4lM",
+    "2610_やどかり": "1aOGW5eG5N43JFl9xcvqRryrloPv_OnCn3vXn67Sx8BY",
+    "2611_やどかり": "18eV1VJ6rQtB8UQ_oFzBNVCd2DUi6Pg5ajRvmC0aGpDw",
+    "2612_やどかり": "14NRgWd1mQ8l_zKQ_XHTQyUvhNQf3h4v3CIRqLN9YWGI",
+}
+
 # 月別マスタのファイル名（{yy}=年下2桁, {mm}=月2桁）。例: 2610_やどかり
 MONTHLY_NAME = "{yy}{mm}_やどかり"
 FAXDM_NAME = "FaxDM訴求文"
@@ -89,7 +107,7 @@ def fix_extract(s: str) -> str:
 
 
 def no_ws(s: str) -> str:
-    return re.sub(r"[\s\u3000]+", "", s or "")
+    return re.sub(r"[\s　]+", "", s or "")
 
 
 def loose(s: str) -> str:
@@ -99,7 +117,7 @@ def loose(s: str) -> str:
 
 
 def describe_ws(s: str) -> str:
-    return s.replace("\u3000", "［全角空白］").replace(" ", "［半角空白］") if s else s
+    return s.replace("　", "［全角空白］").replace(" ", "［半角空白］") if s else s
 
 
 def compare_text(pdf: str, master: str, wrapped: bool = False):
@@ -115,6 +133,7 @@ def compare_text(pdf: str, master: str, wrapped: bool = False):
     if loose(p) == loose(m):
         return "低", "「～」と「〜」など記号の字形差"
     return "高", ""
+
 
 
 def split_sides(lines: list, master_vals: list):
@@ -149,7 +168,6 @@ def split_sides(lines: list, master_vals: list):
     if best and best[0] > 0:
         return best[1], True
     return base, False
-
 
 # ----------------------------------------------------------------------------
 # 設定オブジェクト
@@ -321,7 +339,11 @@ class MasterSource:
 
     def monthly(self, year: int, month: int) -> dict:
         name = self.cfg.monthly_name.format(yy=f"{year % 100:02d}", mm=f"{month:02d}")
-        got = self.provider(name)
+        try:
+            got = self.provider(name)
+        except Exception as e:
+            self.notes.append(f"月別マスタ「{name}」を読み込めませんでした：{e}")
+            return {}
         if not got:
             self.notes.append(f"月別マスタ「{name}」が見つかりません")
             return {}
@@ -329,7 +351,11 @@ class MasterSource:
         return parse_monthly_master(io.BytesIO(data), fname, year, month, self.cfg)
 
     def faxdm(self) -> list:
-        got = self.provider(self.cfg.faxdm_name)
+        try:
+            got = self.provider(self.cfg.faxdm_name)
+        except Exception as e:
+            self.notes.append(f"「{self.cfg.faxdm_name}」を読み込めませんでした：{e}（イチオシの訴求文チェックは省略）")
+            return []
         if not got:
             self.notes.append(f"「{self.cfg.faxdm_name}」が見つかりません（イチオシの訴求文チェックは省略）")
             return []
@@ -349,6 +375,76 @@ def upload_provider(files: dict):
 
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def sheet_id_from(text: str) -> Optional[str]:
+    """スプレッドシートのURL（またはID）からIDを取り出す"""
+    text = (text or "").strip()
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", text)
+    if m:
+        return m.group(1)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{20,}", text) else None
+
+
+def _guess_sheet_name(data: bytes) -> str:
+    """ファイル名が取れなかったときに、中身から「2610_やどかり」「FaxDM訴求文」を推定する"""
+    wb = load_workbook(io.BytesIO(data), read_only=True)
+    for ws in wb.worksheets[:3]:
+        m = re.search(r"(\d{2})年\s*(\d{1,2})月号", ws.title)
+        if m:
+            return MONTHLY_NAME.format(yy=m.group(1), mm=f"{int(m.group(2)):02d}")
+    for row in wb.worksheets[0].iter_rows(min_row=1, max_row=5, values_only=True):
+        vals = {str(v).strip() for v in row if v is not None}
+        if "月" in vals and "日程" in vals:
+            return FAXDM_NAME
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sheet(sheet_id: str):
+    """共有リンクが有効なスプレッドシートを .xlsx として取得する → (bytes, 名前)"""
+    import urllib.parse
+    import requests
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    r = requests.get(url, timeout=60)
+    if r.status_code != 200 or not r.content.startswith(b"PK"):
+        raise RuntimeError("取得できませんでした。共有設定が「リンクを知っている全員（閲覧者）」になっているか確認してください")
+    cd = r.headers.get("Content-Disposition", "")
+    name = ""
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd)
+    if m:
+        name = urllib.parse.unquote(m.group(1))
+    else:
+        m = re.search(r'filename="([^"]+)"', cd)
+        if m:
+            name = m.group(1)
+    name = unicodedata.normalize("NFC", re.sub(r"\.xlsx$", "", name.strip()))
+    if not re.match(r"^\d{4}_|^" + re.escape(FAXDM_NAME), name):
+        name = _guess_sheet_name(r.content) or name
+    return r.content, name
+
+
+def sheet_provider(master_sheets: dict, extra_urls: list, faxdm_id: str, faxdm_name: str):
+    """スプレッドシートのURLから読む。月別マスタは名前で探し、登録がなければ追加URLの中から探す"""
+    extra_ids = [i for i in (sheet_id_from(u) for u in extra_urls) if i]
+
+    def get(name: str):
+        if name == faxdm_name:
+            fid = sheet_id_from(faxdm_id)
+            if not fid:
+                return None
+            data, _ = fetch_sheet(fid)
+            return data, faxdm_name
+        for sid in extra_ids:  # 追加URLを優先（登録済みの月を差し替えたいとき用）
+            data, n = fetch_sheet(sid)
+            if n.startswith(name):
+                return data, n
+        sid = sheet_id_from(master_sheets.get(name, ""))
+        if sid:
+            data, _ = fetch_sheet(sid)
+            return data, name
+        return None
+    return get
 
 
 def _drive_service(sa_info: dict):
@@ -542,7 +638,7 @@ def _join(spans: list) -> str:
     out = ""
     prev = None
     for s in spans:
-        if prev is not None and s.x0 - prev.x1 > max(prev.size, s.size) * 0.6 and not out.endswith((" ", "\u3000", "/")):
+        if prev is not None and s.x0 - prev.x1 > max(prev.size, s.size) * 0.6 and not out.endswith((" ", "　", "/")):
             out += " "
         out += s.text
         prev = s
@@ -1217,9 +1313,9 @@ def write_report(pdf: PdfDoc, findings: list, status: dict, masters: dict, notes
     ws.cell(r0, 1, "指摘件数").font = Font(name=FONT, bold=True)
     ws.cell(r0, 2, "　".join(f"{k}:{v}" for k, v in counts.items())).font = Font(name=FONT)
     rows = []
-    for cat, (stt, det) in sorted(status.items()):
+    for cat, (st, det) in sorted(status.items()):
         n = sum(1 for f in findings if f.category == cat and f.severity != "情報")
-        rows.append([cat, stt, det or (f"{n}件" if n else "")])
+        rows.append([cat, st, det or (f"{n}件" if n else "")])
     _table(ws, ["チェック項目", "結果", "詳細"], rows, [34, 12, 60], start_row=r0 + 2)
     for i in range(r0 + 3, r0 + 3 + len(rows)):
         c = ws.cell(i, 2)
@@ -1382,18 +1478,32 @@ def main():
 
     with st.sidebar:
         st.header("マスタ")
-        modes = (["Googleドライブから自動取得", "ファイルをアップロード"] if has_sa else ["ファイルをアップロード"])
+        modes = ["スプレッドシートから読み込む", "ファイルをアップロード"]
+        if has_sa:
+            modes.insert(0, "Googleドライブから自動取得")
         mode = st.radio("取得方法", modes)
-        uploaded = {}
-        if mode == "ファイルをアップロード":
+        if mode == "スプレッドシートから読み込む":
+            months = sorted(MASTER_SHEETS)
+            st.caption("PDFの掲載期間に合わせて、必要な月のマスタと FaxDM訴求文 を自動で読み込みます"
+                       "（月をまたぐ場合は両方の月）。")
+            st.caption("登録済み：" + (f"{months[0][:4]}〜{months[-1][:4]}" if months else "なし")
+                       + "　／　FaxDM訴求文")
+            extra = st.text_area("未登録の月のURL（1行に1つ）", height=90,
+                                 placeholder="https://docs.google.com/spreadsheets/d/.../edit",
+                                 help="MASTER_SHEETS に登録していない月だけ貼ってください。"
+                                      "毎月使うなら app.py の MASTER_SHEETS に1行追加すると、貼らなくて済みます。")
+            faxdm_url = sec.get("faxdm_sheet_id", FAXDM_SHEET_ID)
+            provider = sheet_provider(MASTER_SHEETS, extra.splitlines(), faxdm_url, cfg.faxdm_name)
+            st.caption("※ シートの共有設定は「リンクを知っている全員」が「閲覧者」にしてください。")
+            if st.button("🔄 マスタを今すぐ取り直す"):
+                st.cache_data.clear()
+                st.toast("次の校正で最新のマスタを取得します")
+        elif mode == "ファイルをアップロード":
             files = st.file_uploader(
                 "マスタ（.xlsx）", type=["xlsx"], accept_multiple_files=True,
                 help="Googleスプレッドシートを「ファイル → ダウンロード → Microsoft Excel」で保存したもの。"
                      "例：2610_やどかり.xlsx、2611_やどかり.xlsx、FaxDM訴求文.xlsx")
-            uploaded = {f.name: f.getvalue() for f in files or []}
-            if not has_sa:
-                st.caption("Secrets にサービスアカウントを設定すると、Googleドライブから自動で取得できます（README参照）。")
-            provider = upload_provider(uploaded)
+            provider = upload_provider({f.name: f.getvalue() for f in files or []})
         else:
             folder = sec.get("drive_folder_id", DRIVE_FOLDER_ID)
             faxdm_id = sec.get("faxdm_sheet_id", FAXDM_SHEET_ID)
