@@ -132,6 +132,8 @@ def compare_text(pdf: str, master: str, wrapped: bool = False):
         return "低", "スペースの種類・有無だけの差（原稿を目視確認）"
     if loose(p) == loose(m):
         return "低", "「～」と「〜」など記号の字形差"
+    if unicodedata.normalize("NFKC", no_ws(p)) == unicodedata.normalize("NFKC", no_ws(m)):
+        return "高", "全角・半角の違い（括弧「（）」と「()」など）"
     return "高", ""
 
 
@@ -775,7 +777,8 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
                     hlines.append((a.y, min(a.x, b.x), max(a.x, b.x)))
             elif it[0] == "re":
                 r = it[1]
-                if r.width > 60 and (dr.get("fill") is None or r.height < 1.5):
+                fill = dr.get("fill")
+                if r.width > 60 and (fill is None or r.height < 1.5 or min(fill) > 0.9):
                     hlines.append((r.y0, r.x0, r.x1))
                     hlines.append((r.y1, r.x0, r.x1))
 
@@ -806,7 +809,7 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             if below:
                 bot = below[0] - 1
             else:
-                bot = cd[i + 1].top - lead if i + 1 < len(cd) else min(d.top + gap * 0.75, grid_bottom)
+                bot = cd[i + 1].top - lead if i + 1 < len(cd) else min(d.top + gap, grid_bottom)
             cell_bounds[id(d)] = (max(top, grid_top), bot)
             prev_bot = bot
 
@@ -822,7 +825,7 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         cell = [s for s in spans if id(s) not in used and top <= s.yc < bot and cl - 6 <= s.x0 < cr
                 and s.text.strip() not in skip_words and not (s.din and s.text.strip().isdigit() and s.size >= 15)]
         # アイコン（タブ）
-        tab = next((t for t in tabs if col_of(t["rect"].x0) == d.col and top <= (t["rect"].y0 + t["rect"].y1) / 2 < bot), None)
+        tab = next((t for t in tabs if col_of((t["rect"].x0 + t["rect"].x1) / 2) == d.col and top <= (t["rect"].y0 + t["rect"].y1) / 2 < bot), None)
         whites = [s for s in cell if s.white]
         type_txt = [s for s in whites if s.text.strip() in TYPE_WORDS
                     or (tab and tab["rect"].contains(pymupdf.Rect(s.x0, s.y0, s.x1, s.y1)))]
@@ -1155,9 +1158,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
         if m:
             add("高", CAT8, None, "", "定型文言", m.group(0)[:len(target)], ph, "定型文言が違います（誤字の可能性）")
             mark(CAT8, False)
-        else:
-            add("情報", CAT8, None, "", "定型文言", "（文字として読み取れず）", ph,
-                "画像またはアウトライン化された文字のため確認できませんでした（目視で確認）")
+        # 文字として読み取れない（画像・アウトライン化）場合は何も出さない
 
     # ⑦ 期間・掲載漏れ
     if pdf.days:
@@ -1244,19 +1245,6 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
         if r.adopt == "否":
             add("中", CAT4, d, wd, "選定可否", "イチオシに掲載", "否", "FaxDM訴求文では「否」になっています")
             mark(CAT4, False)
-    if pdf.days and fax:
-        first, last = pdf.days[0].date, pdf.days[-1].date
-        shown = {it.date for it in pdf.ichioshi}
-        for r in fax:
-            for y in {first.year, last.year}:
-                try:
-                    dd = dt.date(y, r.month, r.day)
-                except ValueError:
-                    continue
-                if first <= dd <= last and r.fixed and r.adopt != "否" and dd not in shown:
-                    add("情報", CAT4, dd, WEEKDAY_JA[dd.weekday()], "確定済みの訴求文", r.fixed, r.menu,
-                        "期間内に確定済みの訴求文がありますが、イチオシ欄には載っていません")
-
     F.sort(key=lambda f: (SEV_ORDER.get(f.severity, 9), f.category, f.date))
     return F, status
 
