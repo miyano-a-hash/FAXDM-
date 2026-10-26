@@ -59,6 +59,15 @@ MASTER_SHEETS = {
     "2612_やどかり": "14NRgWd1mQ8l_zKQ_XHTQyUvhNQf3h4v3CIRqLN9YWGI",
 }
 
+# 個別店舗の原稿用：店舗マスタ（「住所TELFAX・その他」シート）
+STORE_SHEET_ID = "1hP_nKsdwXvu78tbprwwgwMejyk31vsZmtvZNHTOP_CQ"
+STORE_TAB = "住所TELFAX・その他"
+STORE_NAME = "店舗マスタ"
+# 全店共通のQRコード（店舗ごとの照合から外す）。URLにこの文字が含まれていれば共通扱い
+COMMON_QR = ["instagram.com/machino_obento"]
+# 価格欄の弁当名 → 店舗マスタの見出し
+PRICE_COLUMNS = {"デラックス": "DX価格", "ヘルシー": "HC価格", "贅沢": "贅沢価格", "唐揚げ": "唐揚げ価格", "南蛮": "南蛮価格"}
+
 # 月別マスタのファイル名（{yy}=年下2桁, {mm}=月2桁）。例: 2610_やどかり
 MONTHLY_NAME = "{yy}{mm}_やどかり"
 FAXDM_NAME = "FaxDM訴求文"
@@ -331,6 +340,67 @@ def parse_faxdm(src) -> list:
     return rows
 
 
+@dataclass
+class StoreRow:
+    row: int
+    store_id: str
+    name: str
+    official: str
+    tel: str
+    fax: str
+    address: str
+    address_note: str
+    prices: dict
+    qr: str
+    zeitaku: bool
+
+
+def _cell_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def parse_store_master(src) -> list:
+    wb = load_workbook(src, read_only=True, data_only=True)
+    if STORE_TAB not in wb.sheetnames:
+        raise ValueError(f"「{STORE_TAB}」シートが見つかりません")
+    ws = wb[STORE_TAB]
+    rows = list(ws.iter_rows(values_only=True))
+    hdr_i = next((i for i, r in enumerate(rows[:10]) if any(_cell_str(v) == "正式店舗名" for v in r)), None)
+    if hdr_i is None:
+        raise ValueError(f"「{STORE_TAB}」に「正式店舗名」の見出しが見つかりません")
+    hdr = {_cell_str(v): j for j, v in enumerate(rows[hdr_i]) if _cell_str(v)}
+    zcol = next((j for r in rows[:hdr_i] for j, v in enumerate(r) if _cell_str(v) == "贅沢"), None)
+
+    def g(r, key):
+        j = hdr.get(key)
+        return _cell_str(r[j]) if j is not None and j < len(r) else ""
+
+    out = []
+    for i, r in enumerate(rows[hdr_i + 1:], hdr_i + 2):
+        official, name = g(r, "正式店舗名"), g(r, "店舗名")
+        if not (official or name):
+            continue
+        addr = g(r, "記載住所")
+        note = ""
+        if "※" in addr:
+            addr, note = addr.split("※", 1)
+            note = "※" + note.strip()
+        addr = (addr.strip() + " " + g(r, "住所２")).strip()
+        prices = {}
+        for lab, key in PRICE_COLUMNS.items():
+            v = g(r, key)
+            if re.fullmatch(r"\d+", v.replace(",", "")):
+                prices[lab] = int(v.replace(",", ""))
+        z = zcol is not None and zcol < len(r) and _cell_str(r[zcol]) == "贅沢"
+        out.append(StoreRow(i, g(r, "店舗ID"), name, official, g(r, "記載用電話番号"), g(r, "記載用FAX番号"),
+                            addr, note, prices, g(r, "QRコード用URL"), z))
+    return out
+
+
 class MasterSource:
     """マスタの取得元。provider は name -> (bytes, ファイル名) を返す関数。"""
 
@@ -363,12 +433,33 @@ class MasterSource:
             return []
         return parse_faxdm(io.BytesIO(got[0]))
 
+    def stores(self) -> list:
+        try:
+            got = self.provider(STORE_NAME)
+        except Exception as e:
+            self.notes.append(f"店舗マスタを読み込めませんでした：{e}（店舗情報のチェックは省略）")
+            return []
+        if not got:
+            self.notes.append("店舗マスタ（「住所TELFAX・その他」シート）が見つかりません（店舗情報のチェックは省略）")
+            return []
+        return parse_store_master(io.BytesIO(got[0]))
+
 
 def upload_provider(files: dict):
     """アップロードされた .xlsx（ファイル名 -> bytes）から探す"""
     norm = {unicodedata.normalize("NFC", k): v for k, v in files.items()}
 
     def get(name: str):
+        if name == STORE_NAME:  # シート名で探す
+            for fname in sorted(norm):
+                if not fname.lower().endswith(".xlsx"):
+                    continue
+                try:
+                    if STORE_TAB in load_workbook(io.BytesIO(norm[fname]), read_only=True).sheetnames:
+                        return norm[fname], fname
+                except Exception:
+                    continue
+            return None
         for fname in sorted(norm):
             if fname.startswith(name) and fname.lower().endswith(".xlsx"):
                 return norm[fname], fname
@@ -426,11 +517,14 @@ def fetch_sheet(sheet_id: str):
     return r.content, name
 
 
-def sheet_provider(master_sheets: dict, extra_urls: list, faxdm_id: str, faxdm_name: str):
+def sheet_provider(master_sheets: dict, extra_urls: list, faxdm_id: str, faxdm_name: str, store_id: str = ""):
     """スプレッドシートのURLから読む。月別マスタは名前で探し、登録がなければ追加URLの中から探す"""
     extra_ids = [i for i in (sheet_id_from(u) for u in extra_urls) if i]
 
     def get(name: str):
+        if name == STORE_NAME:
+            sid = sheet_id_from(store_id)
+            return (fetch_sheet(sid)[0], STORE_NAME) if sid else None
         if name == faxdm_name:
             fid = sheet_id_from(faxdm_id)
             if not fid:
@@ -482,11 +576,14 @@ def _drive_export(sa_json: str, file_id: str, modified: str) -> bytes:
     return svc.files().export(fileId=file_id, mimeType=XLSX_MIME).execute()
 
 
-def drive_provider(sa_info: dict, folder_id: str, faxdm_id: str, faxdm_name: str):
+def drive_provider(sa_info: dict, folder_id: str, faxdm_id: str, faxdm_name: str, store_id: str = ""):
     import json
     sa_json = json.dumps(dict(sa_info), sort_keys=True)
 
     def get(name: str):
+        if name == STORE_NAME:
+            sid = sheet_id_from(store_id)
+            return (_drive_export(sa_json, sid, dt.datetime.now().strftime("%Y%m%d%H%M")[:11]), STORE_NAME) if sid else None
         if name == faxdm_name and faxdm_id:
             return _drive_export(sa_json, faxdm_id, dt.datetime.now().strftime("%Y%m%d%H%M")[:11]), name
         files = _drive_list(sa_json, folder_id)
@@ -547,6 +644,7 @@ class PdfDay:
     side_lines: list = field(default_factory=list)
     zeitaku: list = field(default_factory=list)     # [(text, wrapped)]
     zeitaku_has_slash: bool = False
+    zeitaku_lines: list = field(default_factory=list)
     icon_type: Optional[str] = None
     icon_how: str = ""
     icon_name: str = ""
@@ -591,6 +689,16 @@ class PdfDoc:
     fulltext: str
     footnote_text: str
     warnings: list
+    grid_top: float = 0.0
+    phrases: list = field(default_factory=list)     # [(text, y0)] 「〜メニューに加え」の文
+    store: dict = field(default_factory=dict)       # 個別原稿の店舗欄 {name, address, tel, fax}
+    prices: dict = field(default_factory=dict)      # {"ヘルシー": 500, ...}
+    qr_urls: list = field(default_factory=list)
+    qr_note: str = ""
+
+    @property
+    def individual(self) -> bool:
+        return bool(self.store.get("name")) and bool(self.store.get("tel") or self.store.get("address"))
 
 
 def _spans(page) -> list:
@@ -700,7 +808,8 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     def col_right(i: int) -> float:
         return col_lefts[i + 1] - 3 if i + 1 < len(col_lefts) else page_w
 
-    zeitaku_edition = any(s.text.strip() == "贅沢弁当" and s.y0 > grid_top - 5 for s in spans)
+    zeitaku_edition = any(s.text.strip() == "贅沢弁当" and s.y0 > grid_top - 5 for s in spans) or \
+        sum(1 for s in spans if s.text.strip() == "贅沢" and s.size <= 8 and grid_top < s.y0 < grid_bottom) >= 2
     weekday_spans = [s for s in spans if s.text.strip() in WEEKDAY_CHARS]
     din_digits = [s for s in spans if s.din and s.text.strip().isdigit()]
 
@@ -816,7 +925,12 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     order_x = {}
     for c in range(len(col_lefts)):
         ko = [s.x0 for s in spans if s.text.strip() == "個" and col_of(s.x0) == c and grid_top < s.y0 < grid_bottom]
-        order_x[c] = (min(ko) - 12) if ko else col_lefts[c] + (col_right(c) - col_lefts[c]) * 0.66
+        if ko:
+            order_x[c] = min(ko) - 12
+        else:  # 「個」が図形化されている場合：注文欄の罫線の右端から目安をとる
+            rights = [x1 for y, x0, x1 in hlines if grid_top - 2 < y < grid_bottom + 2 and x0 <= col_lefts[c] + 12]
+            right = min(max(rights), col_right(c)) if rights else col_right(c)
+            order_x[c] = col_lefts[c] + (right - col_lefts[c]) * 0.66
 
     skip_words = {"個", "備考", "ヘルシー", "デラックス", "贅沢弁当"}
     for d in days:
@@ -880,6 +994,7 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             joined = "\n".join(fix_extract(t) for t, _ in z_lines)
             d.zeitaku_has_slash = "/" in joined
             parts = joined.split("/") if d.zeitaku_has_slash else [joined]
+            d.zeitaku_lines = [fix_extract(t) for t, _ in z_lines]
             d.zeitaku = [(p.replace("\n", "").strip(), "\n" in p.strip()) for p in parts if p.strip()]
     days.sort(key=lambda d: (d.year, d.month, d.day))
 
@@ -951,6 +1066,10 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         menu = fix_extract("".join(_join(l["spans"]).strip() for l in mlines))
         comment = fix_extract("".join(_join(l["spans"]) for l in clines))
         event = fix_extract("".join(_join(l["spans"]) for l in _group_lines(event_sp)))
+        mb = re.match(r"^【(.+?)】\s*(.*)$", menu)
+        if mb:  # 「【ごちそう洋食メニュー】海老フライ…」のようにイベント名が先頭にある
+            event = event or mb.group(1)
+            menu = mb.group(2)
         ichioshi.append(Ichioshi(int(s.text.strip()), month, w.text.strip(), itype, event, menu,
                                  len(mlines) > 1, comment))
     for it in ichioshi:
@@ -961,7 +1080,82 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             it.year = days[0].year if it.month >= days[0].month else days[0].year + 1
 
     footnote_text = "".join(fix_extract(s.text) for s in spans if s.y0 >= grid_bottom - 2)
-    return PdfDoc(name, title, zeitaku_edition, period, days, ichioshi, fulltext, footnote_text, warnings)
+    phrases = [(fix_extract(s.text), s.y0) for s in spans if "メニューに加え" in s.text]
+    store = _read_store_block(spans, grid_bottom)
+    prices = _read_prices(spans, grid_top)
+    qr_urls, qr_note = _read_qr(page)
+    return PdfDoc(name, title, zeitaku_edition, period, days, ichioshi, fulltext, footnote_text, warnings,
+                  grid_top, phrases, store, prices, qr_urls, qr_note)
+
+
+PHONE_RE = re.compile(r"(\d{2,5}-\d{1,4}-\d{3,4})")
+COMMON_PHONES = {"0120-790-531"}  # 配信停止のFAX番号など全店共通
+
+
+def _read_store_block(spans: list, grid_bottom: float) -> dict:
+    """原稿下部の店舗欄（店舗名・住所・TEL・FAX）を読む。全店共通の原稿では空になる"""
+    notes = [s for s in spans if s.y0 >= grid_bottom - 2 and ("※衛生面" in s.text or "売切れの場合" in s.text)]
+    y_from = (max(s.y1 for s in notes) if notes else grid_bottom) + 12
+    stop = [s.y0 for s in spans if ("FAX不要" in s.text or "不要連絡" in s.text) and s.y0 > y_from]
+    y_to = min(stop) - 2 if stop else 1e9
+    skip = ("法人名", "ご住所", "ご担当者", "部署名", "ビル名", "配信停止", "不要連絡", "お問い合わせ", "ご注文", "前日")
+    foot = [s for s in spans if y_from <= s.y0 < y_to and not s.white and not any(k in s.text for k in skip)]
+    text_all = unicodedata.normalize("NFKC", "".join(s.text for s in sorted(foot, key=lambda s: (round(s.y0), s.x0))))
+    out = {}
+    m = re.search(r"TEL[:：]?\s*(\d{2,5}-\d{1,4}-\d{3,4})", text_all)
+    if m and m.group(1) not in COMMON_PHONES:
+        out["tel"] = m.group(1)
+    phones = [(s, PHONE_RE.search(unicodedata.normalize("NFKC", s.text))) for s in foot]
+    faxes = [(s, mm.group(1)) for s, mm in phones if mm and mm.group(1) not in COMMON_PHONES
+             and "TEL" not in unicodedata.normalize("NFKC", s.text).upper()]
+    if faxes:
+        out["fax"] = max(faxes, key=lambda x: x[0].size)[1]
+    words = [s for s in foot if len(s.text.strip()) >= 2 and re.search(r"[ぁ-んァ-ン一-龥A-Za-z]", s.text)
+             and not PHONE_RE.search(unicodedata.normalize("NFKC", s.text))
+             and not any(k in s.text for k in ("TEL", "FAX"))]
+    addr = [s for s in words if re.match(r"^\s*(北海道|東京都|大阪府|京都府|\S{2,3}県)", s.text)]
+    if addr:
+        out["address"] = fix_extract(addr[0].text)
+    names = [s for s in words if s not in addr and s.size >= 12]
+    if names:
+        out["name"] = fix_extract(max(names, key=lambda s: s.size).text)
+    return out
+
+
+def _read_prices(spans: list, grid_top: float) -> dict:
+    """右上の価格欄（「ヘルシー弁当 500円」など）を読む"""
+    out = {}
+    for s in spans:
+        if s.y0 >= grid_top or "弁当" not in s.text:
+            continue
+        lab = next((k for k in PRICE_COLUMNS if k in s.text or (k == "唐揚げ" and "から揚げ" in s.text)), None)
+        if not lab:
+            continue
+        nums = [x for x in spans if x.x0 > s.x1 - 2 and abs(x.yc - s.yc) < max(s.size, x.size) * 0.6
+                and re.fullmatch(r"[\d,]+", unicodedata.normalize("NFKC", x.text.strip()))]
+        if nums:
+            v = min(nums, key=lambda x: x.x0)
+            out[lab] = int(unicodedata.normalize("NFKC", v.text.strip()).replace(",", ""))
+    return out
+
+
+def _read_qr(page):
+    """ページ上のQRコードをすべて読む → (URLのリスト, お知らせ)"""
+    try:
+        import numpy as np
+        import zxingcpp
+    except Exception:
+        return [], "QRコードを読むライブラリ（zxing-cpp）がないため、QRコードのチェックは省略しました"
+    urls = []
+    for dpi in (200, 300):
+        pix = page.get_pixmap(dpi=dpi)
+        arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
+        for r in zxingcpp.read_barcodes(arr):
+            if r.text and r.text not in urls:
+                urls.append(r.text)
+        if urls:
+            break
+    return urls, ""
 
 
 # ----------------------------------------------------------------------------
@@ -983,7 +1177,105 @@ def fmt_date(d: Optional[dt.date]) -> str:
     return f"{d.month}/{d.day}" if d else "-"
 
 
-def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
+def _norm_key(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "").replace("★", "").replace("☆", "")
+    s = re.sub(r"[‐‑‒–—―−]", "-", s)
+    return re.sub(r"\s+", "", s)
+
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", unicodedata.normalize("NFKC", s or ""))
+
+
+def _norm_url(u: str) -> str:
+    u = (u or "").strip()
+    u = re.sub(r"^https?://", "", u)
+    return u.rstrip("/").lower()
+
+
+def find_store(pdf_store: dict, stores: list):
+    """店舗欄の店舗名でマスタを探す → (行, 見つけ方)"""
+    name = _norm_key(pdf_store.get("name", ""))
+    for key in ("official", "name"):
+        hit = [r for r in stores if name and _norm_key(getattr(r, key)) == name]
+        if hit:
+            return hit[0], ("正式店舗名" if key == "official" else "店舗名")
+    hit = [r for r in stores if name and r.official and (name in _norm_key(r.official) or _norm_key(r.official) in name)]
+    if len(hit) == 1:
+        return hit[0], "正式店舗名（部分一致）"
+    tel, fax = _digits(pdf_store.get("tel")), _digits(pdf_store.get("fax"))
+    hit = [r for r in stores if (tel and _digits(r.tel) == tel) or (fax and _digits(r.fax) == fax)]
+    if len(hit) == 1:
+        return hit[0], "電話・FAX番号"
+    return None, ""
+
+
+def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
+    ps = pdf.store
+    row, how = find_store(ps, stores)
+    if row is None:
+        add("高", cat, None, "", "店舗名", ps.get("name", ""), "（マスタに該当なし）",
+            "店舗マスタの正式店舗名（D列）に見つかりません")
+        mark(cat, False)
+        return
+    ref = f"{row.official}（{row.row}行目）"
+    if how != "正式店舗名":
+        add("中", cat, None, "", "店舗名", ps.get("name", ""), row.official,
+            f"正式店舗名と一致しません（{how}で特定：{row.row}行目）")
+        mark(cat, False)
+    # 住所
+    if row.address or ps.get("address"):
+        if _norm_key(ps.get("address", "")) != _norm_key(row.address):
+            add("高", cat, None, "", "住所", ps.get("address", "（なし）"), row.address or "（マスタは空欄）",
+                ("マスタ備考：" + row.address_note) if row.address_note else ref)
+            mark(cat, False)
+        elif row.address_note:
+            add("情報", cat, None, "", "住所", ps.get("address", ""), row.address, "マスタ備考：" + row.address_note)
+    # 電話・FAX
+    for lab, pv, mv in (("電話番号", ps.get("tel", ""), row.tel), ("FAX番号", ps.get("fax", ""), row.fax)):
+        if not (pv or mv):
+            continue
+        if _digits(pv) != _digits(mv):
+            add("高", cat, None, "", lab, pv or "（なし）", mv or "（マスタは空欄）", ref)
+            mark(cat, False)
+    # 価格
+    for lab, col in PRICE_COLUMNS.items():
+        pv, mv = pdf.prices.get(lab), row.prices.get(lab)
+        name = f"{lab}弁当の価格"
+        if pv is not None and mv is None:
+            add("中", cat, None, "", name, f"{pv}円", f"（マスタの{col}は空欄）", ref)
+            mark(cat, False)
+        elif pv is not None and pv != mv:
+            add("高", cat, None, "", name, f"{pv}円", f"{mv}円", f"マスタ：{col}")
+            mark(cat, False)
+        elif pv is None and mv is not None and (lab in ("ヘルシー", "デラックス") or (lab == "贅沢" and pdf.zeitaku)):
+            add("高", cat, None, "", name, "（記載なし）", f"{mv}円", "価格欄に見当たりません")
+            mark(cat, False)
+    # 贅沢の契約と版
+    if row.zeitaku and not pdf.zeitaku:
+        add("中", cat, None, "", "版", "贅沢なし", "贅沢あり", "店舗マスタでは贅沢ありの店舗です")
+        mark(cat, False)
+    elif pdf.zeitaku and not row.zeitaku and "贅沢" in pdf.prices:
+        add("中", cat, None, "", "版", "贅沢あり", "贅沢なし", "店舗マスタでは贅沢の印がありません")
+        mark(cat, False)
+    # QRコード
+    if pdf.qr_note:
+        add("情報", cat, None, "", "QRコード", "（未チェック）", row.qr, pdf.qr_note)
+        return
+    own = [u for u in pdf.qr_urls if not any(c in u for c in COMMON_QR)]
+    if row.qr and not own:
+        add("高", cat, None, "", "QRコードのリンク", "（店舗のQRコードなし）", row.qr,
+            "店舗のQRコードが見つからないか、読み取れませんでした")
+        mark(cat, False)
+    elif own and not row.qr:
+        add("中", cat, None, "", "QRコードのリンク", " / ".join(own), "（マスタのW列は空欄）", ref)
+        mark(cat, False)
+    elif own and _norm_url(row.qr) not in {_norm_url(u) for u in own}:
+        add("高", cat, None, "", "QRコードのリンク", " / ".join(own), row.qr, "QRコードのリンク先がマスタと違います")
+        mark(cat, False)
+
+
+def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optional[list] = None):
     F = []
     status = {}
 
@@ -1056,7 +1348,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
             for f, (v, wr) in zip(ZEITAKU_FIELDS, d.zeitaku):
                 pdf_vals[f] = (v, wr)
             # 「/」がなく、2行がそれぞれ贅沢1・2に当たる場合
-            if not d.zeitaku_has_slash and len(d.zeitaku) == 1 and md.fields.get("zeitaku2", "").strip():
+            if not d.zeitaku_has_slash and len(d.zeitaku) == 1 and md.fields.get("zeitaku2", "").strip() \
+                    and any(x.zeitaku_has_slash for x in pdf.days):
                 joined = d.zeitaku[0][0]
                 z1, z2 = md.fields["zeitaku1"], md.fields["zeitaku2"]
                 if no_ws(joined) == no_ws(z1 + z2):
@@ -1065,6 +1358,17 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
                     add("低", CAT2, d.date, wd, "贅沢弁当", joined, f"{z1} / {z2}",
                         "贅沢弁当1と2の間に区切りの「/」がありません（他の日は「/」区切り）")
                     mark(CAT2, False)
+            if not any(x.zeitaku_has_slash for x in pdf.days) and len(d.zeitaku_lines) >= 2 \
+                    and md.fields.get("zeitaku2", "").strip():
+                # 「/」を使わず、贅沢弁当1・2を行で分けるレイアウト：マスタに合う区切り位置を探す
+                z1, z2 = md.fields["zeitaku1"], md.fields["zeitaku2"]
+                ls = d.zeitaku_lines
+                cut = next((k for k in range(1, len(ls)) if no_ws("".join(ls[:k])) == no_ws(z1)), None)
+                if cut is None:
+                    cut = next((k for k in range(1, len(ls)) if no_ws("".join(ls[k:])) == no_ws(z2)), len(ls) - 1)
+                pdf_vals["zeitaku1"] = ("".join(ls[:cut]), cut > 1)
+                pdf_vals["zeitaku2"] = ("".join(ls[cut:]), len(ls) - cut > 1)
+                d.zeitaku = [pdf_vals["zeitaku1"], pdf_vals["zeitaku2"]]
             fields = ["main", "submain"] + ZEITAKU_FIELDS
         for f in fields:
             mv = md.fields.get(f, "")
@@ -1144,9 +1448,19 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
     # ⑤ 贅沢あり定型文
     if pdf.zeitaku:
         for ph in cfg.zeitaku_required:
-            if no_ws(ph) not in no_ws(pdf.fulltext):
-                add("高", CAT5, None, "", "定型文", "（なし）", ph, "贅沢あり版に必要な文言が見当たりません")
-                mark(CAT5, False)
+            exp = ph
+            if "上記" in ph and pdf.phrases:
+                # 注文欄より上に置いた文なら「下記」、下に置いた文なら「上記」が正しい
+                exp = ph.replace("上記", "下記") if pdf.phrases[0][1] < pdf.grid_top else ph
+            if no_ws(exp) in no_ws(pdf.fulltext):
+                continue
+            found = next((t for t, _ in pdf.phrases), "")
+            if found:
+                where = "注文欄の上" if pdf.phrases[0][1] < pdf.grid_top else "注文欄の下"
+                add("高", CAT5, None, "", "定型文", found.split("\u3000")[0], exp, f"文言が違います（{where}にあるので「{'下記' if '下記' in exp else '上記'}」）")
+            else:
+                add("高", CAT5, None, "", "定型文", "（なし）", exp, "贅沢あり版に必要な文言が見当たりません")
+            mark(CAT5, False)
     # ⑧ 共通文言
     for ph in cfg.common_required:
         target = no_ws(ph)
@@ -1245,6 +1559,15 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config):
         if r.adopt == "否":
             add("中", CAT4, d, wd, "選定可否", "イチオシに掲載", "否", "FaxDM訴求文では「否」になっています")
             mark(CAT4, False)
+    # ⑨ 個別原稿：店舗情報
+    if pdf.individual:
+        CAT9 = "⑨店舗情報（個別原稿）"
+        status[CAT9] = ("OK", "")
+        if not stores:
+            status[CAT9] = ("要確認", "店舗マスタが読み込めないためチェックできません")
+        else:
+            _check_store(pdf, stores, add, mark, CAT9)
+
     F.sort(key=lambda f: (SEV_ORDER.get(f.severity, 9), f.category, f.date))
     return F, status
 
@@ -1291,6 +1614,9 @@ def write_report(pdf: PdfDoc, findings: list, status: dict, masters: dict, notes
         ("掲載日", f"{fmt_date(pdf.days[0].date)}〜{fmt_date(pdf.days[-1].date)}（{len(pdf.days)}日）" if pdf.days else "-"),
         ("ファイル名の掲載期間", f"{fmt_date(pdf.period[1])}〜{fmt_date(pdf.period[2])}" if pdf.period else "読み取れず"),
         ("参照マスタ", ", ".join(sorted({m.source for m in masters.values()})) or "なし"),
+        ("店舗（個別原稿）", (f"{pdf.store.get('name', '')} ／ {pdf.store.get('address', '')} ／ TEL {pdf.store.get('tel', '-')}"
+                         f" ／ FAX {pdf.store.get('fax', '-')} ／ " + "・".join(f"{k}{v}円" for k, v in pdf.prices.items())
+                         + (" ／ QR " + " / ".join(pdf.qr_urls) if pdf.qr_urls else "")) if pdf.individual else "－（全店共通の原稿）"),
         ("実行日時", dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
     ]
     for i, (k, v) in enumerate(info, 3):
@@ -1375,11 +1701,13 @@ def run_one(name: str, data: bytes, src: MasterSource, cfg: Config) -> dict:
     for y, m in sorted({(d.year, d.month) for d in pdf.days if d.year}):
         masters.update(src.monthly(y, m))
     fax = src.faxdm()
-    findings, status = run_checks(pdf, masters, fax, cfg)
+    stores = src.stores() if pdf.individual else None
+    findings, status = run_checks(pdf, masters, fax, cfg, stores)
     notes = list(dict.fromkeys(src.notes))
     excel = write_report(pdf, findings, status, masters, notes)
+    used = sorted({m.source for m in masters.values()}) + ([STORE_TAB] if stores else [])
     return {"name": name, "pdf": pdf, "findings": findings, "status": status, "notes": notes,
-            "masters": sorted({m.source for m in masters.values()}), "excel": excel, "error": None}
+            "masters": used, "excel": excel, "error": None}
 
 
 # ----------------------------------------------------------------------------
@@ -1405,6 +1733,11 @@ def show_result(r: dict):
         f"{'贅沢あり' if pdf.zeitaku else '贅沢なし'}版　｜　掲載日 {fmt_date(days[0].date)}〜{fmt_date(days[-1].date)}（{len(days)}日）"
         + (f"　｜　ファイル名の期間 {fmt_date(pdf.period[1])}〜{fmt_date(pdf.period[2])}" if pdf.period else "")
         + f"　｜　参照マスタ：{', '.join(r['masters']) or 'なし'}")
+    if pdf.individual:
+        stx = pdf.store
+        st.info(f"個別原稿：{stx.get('name', '')}　｜　{stx.get('address', '')}　｜　TEL {stx.get('tel', '-')}　｜　FAX {stx.get('fax', '-')}"
+                + "　｜　価格 " + "・".join(f"{k}{v}円" for k, v in pdf.prices.items())
+                + ("　｜　QR " + " / ".join(u for u in pdf.qr_urls if not any(c in u for c in COMMON_QR)) if pdf.qr_urls else ""))
     for n in r["notes"] + pdf.warnings:
         st.warning(n)
 
@@ -1475,13 +1808,14 @@ def main():
             st.caption("PDFの掲載期間に合わせて、必要な月のマスタと FaxDM訴求文 を自動で読み込みます"
                        "（月をまたぐ場合は両方の月）。")
             st.caption("登録済み：" + (f"{months[0][:4]}〜{months[-1][:4]}" if months else "なし")
-                       + "　／　FaxDM訴求文")
+                       + "　／　FaxDM訴求文　／　店舗マスタ（個別原稿のとき）")
             extra = st.text_area("未登録の月のURL（1行に1つ）", height=90,
                                  placeholder="https://docs.google.com/spreadsheets/d/.../edit",
                                  help="MASTER_SHEETS に登録していない月だけ貼ってください。"
                                       "毎月使うなら app.py の MASTER_SHEETS に1行追加すると、貼らなくて済みます。")
             faxdm_url = sec.get("faxdm_sheet_id", FAXDM_SHEET_ID)
-            provider = sheet_provider(MASTER_SHEETS, extra.splitlines(), faxdm_url, cfg.faxdm_name)
+            provider = sheet_provider(MASTER_SHEETS, extra.splitlines(), faxdm_url, cfg.faxdm_name,
+                                      sec.get("store_sheet_id", STORE_SHEET_ID))
             st.caption("※ シートの共有設定は「リンクを知っている全員」が「閲覧者」にしてください。")
             if st.button("🔄 マスタを今すぐ取り直す"):
                 st.cache_data.clear()
@@ -1490,12 +1824,14 @@ def main():
             files = st.file_uploader(
                 "マスタ（.xlsx）", type=["xlsx"], accept_multiple_files=True,
                 help="Googleスプレッドシートを「ファイル → ダウンロード → Microsoft Excel」で保存したもの。"
-                     "例：2610_やどかり.xlsx、2611_やどかり.xlsx、FaxDM訴求文.xlsx")
+                     "例：2610_やどかり.xlsx、2611_やどかり.xlsx、FaxDM訴求文.xlsx。"
+                     "個別原稿のときは「住所TELFAX・その他」シートのあるファイルも入れてください")
             provider = upload_provider({f.name: f.getvalue() for f in files or []})
         else:
             folder = sec.get("drive_folder_id", DRIVE_FOLDER_ID)
             faxdm_id = sec.get("faxdm_sheet_id", FAXDM_SHEET_ID)
-            provider = drive_provider(sec["gcp_service_account"], folder, faxdm_id, cfg.faxdm_name)
+            provider = drive_provider(sec["gcp_service_account"], folder, faxdm_id, cfg.faxdm_name,
+                                      sec.get("store_sheet_id", STORE_SHEET_ID))
             st.caption("最新のマスタを取得します（10分間は同じ内容を使い回します）。")
             if st.button("🔄 マスタを今すぐ取り直す"):
                 st.cache_data.clear()
