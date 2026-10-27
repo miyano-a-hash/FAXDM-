@@ -98,6 +98,13 @@ ICON_GLYPH_SIGNATURES = {
     (11, 19, 13, 14, 16): "スペシャル",
     (8, 12, 12): "フェア",
 }
+# 注文欄の見出し（左から）。図形になっている場合は文字ごとのパス数の並びで見分ける
+ORDER_HEADERS = ["ヘルシー", "デラックス", "贅沢弁当"]
+HEADER_GLYPH_SIGNATURES = {
+    (11, 16, 13, 1): "ヘルシー",
+    (19, 9, 13, 9, 11): "デラックス",
+    (78, 24, 33, 24): "贅沢弁当",
+}
 MENU_FIELDS = ["main", "submain", "fukusai1", "fukusai2", "salad"]
 ZEITAKU_FIELDS = ["zeitaku1", "zeitaku2"]
 FIELD_JA = {"main": "メイン", "submain": "サブメイン", "fukusai1": "副菜1", "fukusai2": "副菜2",
@@ -721,6 +728,8 @@ class PdfDoc:
     prices: dict = field(default_factory=dict)      # {"ヘルシー": 500, ...}
     qr_urls: list = field(default_factory=list)
     qr_note: str = ""
+    order_headers: list = field(default_factory=list)  # 注文欄ごとの見出し（左から）
+    price_labels: list = field(default_factory=list)   # 価格欄の弁当名（上から・左から）
 
     @property
     def individual(self) -> bool:
@@ -848,6 +857,9 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         sum(1 for s in spans if s.text.strip() == "贅沢" and s.size <= 8 and grid_top < s.y0 < grid_bottom) >= 2
     weekday_spans = [s for s in spans if s.text.strip() in WEEKDAY_CHARS]
     din_digits = [s for s in spans if s.din and s.text.strip().isdigit()]
+
+    # --- 注文欄の見出し（ヘルシー／デラックス／贅沢弁当）---
+    order_headers = _read_order_headers(page, spans, headers, col_lefts, col_right)
 
     # --- グリッドの日付 ---
     days = []
@@ -1164,9 +1176,45 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     phrases = [(fix_extract(s.text), s.y0) for s in spans if "メニューに加え" in s.text]
     store = _read_store_block(spans, grid_bottom)
     prices = _read_prices(spans, grid_top)
+    price_labels = _read_price_labels(spans, grid_top)
     qr_urls, qr_note = _read_qr(page)
     return PdfDoc(name, title, zeitaku_edition, period, days, ichioshi, fulltext, footnote_text, warnings,
-                  grid_top, phrases, store, prices, qr_urls, qr_note)
+                  grid_top, phrases, store, prices, qr_urls, qr_note, order_headers, price_labels)
+
+
+def _read_order_headers(page, spans, headers, col_lefts, col_right) -> list:
+    """注文欄ごとに、見出しの並び（左から）を読む。文字でも図形でも対応"""
+    drawings = page.get_drawings()
+    out = []
+    for c, h in enumerate(headers):
+        y_lo, y_hi = h.y0 - 4, h.y1 + 4
+        x_lo, x_hi = h.x1 + 4, col_right(c)
+        found = []  # (x, label)
+        for sp in spans:
+            t = sp.text.strip()
+            if t in ORDER_HEADERS and y_lo <= sp.yc <= y_hi and x_lo <= sp.x0 < x_hi:
+                found.append((sp.x0, t))
+        if not found:  # 図形の場合：縦線で区切って、文字の形から判定
+            glyphs = []
+            for dr in drawings:
+                r, fill = dr["rect"], dr.get("fill")
+                if fill and sum(fill) < 0.8 and 0.5 < r.width < 14 and r.height < 14 \
+                        and y_lo <= r.y0 and r.y1 <= y_hi and x_lo <= r.x0 < x_hi:
+                    glyphs.append((r.x0, len(dr["items"])))
+            vlines = sorted({round(it[1].x, 1) for dr in drawings for it in dr["items"]
+                             if it[0] == "l" and abs(it[1].x - it[2].x) < 0.5 and x_lo - 4 <= it[1].x <= x_hi
+                             and min(it[1].y, it[2].y) <= y_lo + 8 and max(it[1].y, it[2].y) >= y_hi - 8})
+            if vlines:  # 一番右の縦線＝注文欄の右端（その外の絵などは見ない）
+                glyphs = [g for g in glyphs if g[0] < vlines[-1]]
+            if glyphs:
+                bounds = [x_lo - 4] + vlines + ([] if vlines else [x_hi + 1])
+                for a, b in zip(bounds, bounds[1:]):
+                    g = sorted(x for x in glyphs if a <= x[0] < b)
+                    if g:
+                        sig = tuple(n for _, n in g)
+                        found.append((g[0][0], HEADER_GLYPH_SIGNATURES.get(sig, "（判定不可）")))
+        out.append([t for _, t in sorted(found)])
+    return out
 
 
 PHONE_RE = re.compile(r"(\d{2,5}-\d{1,4}-\d{3,4})")
@@ -1218,6 +1266,18 @@ def _read_prices(spans: list, grid_top: float) -> dict:
             v = min(nums, key=lambda x: x.x0)
             out[lab] = int(unicodedata.normalize("NFKC", v.text.strip()).replace(",", ""))
     return out
+
+
+def _read_price_labels(spans: list, grid_top: float) -> list:
+    """価格欄に並んでいる弁当名を、上から（同じ高さなら左から）順に返す"""
+    found = []
+    for s in spans:
+        if s.y1 >= grid_top or "弁当" not in s.text:  # 注文欄の見出し行（「贅沢弁当」）は含めない
+            continue
+        lab = next((k for k in PRICE_COLUMNS if k in s.text or (k == "唐揚げ" and "から揚げ" in s.text)), None)
+        if lab:
+            found.append((round(s.yc / 6), s.x0, lab))
+    return [lab for _, _, lab in sorted(found)]
 
 
 def _read_qr(page):
@@ -1690,6 +1750,46 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             add("中", CAT4, d, wd, "選定可否", "イチオシに掲載", "否",
                 f"イチオシ欄に載っていますが、FaxDM訴求文の{fmt_date(d)}の行は「選定可否」が「否」です")
             mark(CAT4, False)
+    # ⑩ 注文欄の見出しの並び
+    CAT10 = "⑩見出しの並び（注文欄・価格欄）"
+    exp_h = ORDER_HEADERS[:2] + (["贅沢弁当"] if pdf.zeitaku else [])
+    readable = [h for h in pdf.order_headers if h]
+    if readable:
+        status[CAT10] = ("OK", "")
+        for ci, got_h in enumerate(pdf.order_headers):
+            if not got_h or got_h == exp_h:
+                continue
+            where = f"{'左' if ci == 0 else '右'}の注文欄" if len(pdf.order_headers) > 1 else "注文欄"
+            if sorted(got_h) == sorted(exp_h):
+                why = f"{where}の見出しは左から「{' → '.join(exp_h)}」の順のはずですが、順番が違います"
+            elif "（判定不可）" in got_h:
+                why = f"{where}の見出しに読み取れないものがあります（目視で確認）"
+            else:
+                miss = [x for x in exp_h if x not in got_h]
+                extra = [x for x in got_h if x not in exp_h]
+                why = f"{where}の見出しは左から「{' → '.join(exp_h)}」のはずです" + \
+                      (f"（「{'」「'.join(miss)}」がありません）" if miss else "") + \
+                      (f"（「{'」「'.join(extra)}」は{'贅沢なし版には不要' if '贅沢弁当' in extra and not pdf.zeitaku else '余分'}です）" if extra else "")
+            add("高", CAT10, None, "", "注文欄の見出し", " → ".join(got_h), " → ".join(exp_h), why)
+            mark(CAT10, False)
+    # 価格欄の並び（ヘルシー → デラックス → 贅沢。唐揚げ・南蛮があればその後）
+    if pdf.price_labels:
+        status.setdefault(CAT10, ("OK", ""))
+        exp_p = ["ヘルシー", "デラックス"] + (["贅沢"] if pdf.zeitaku else [])
+        got_p = [x for x in pdf.price_labels if x in ("ヘルシー", "デラックス", "贅沢")]
+        if got_p != exp_p:
+            fmt = lambda xs: " → ".join(f"{x}弁当" for x in xs)
+            if sorted(got_p) == sorted(exp_p):
+                why = f"価格欄は上から「{fmt(exp_p)}」の順のはずですが、順番が違います"
+            else:
+                miss = [x for x in exp_p if x not in got_p]
+                extra = [x for x in got_p if x not in exp_p]
+                why = f"価格欄は上から「{fmt(exp_p)}」のはずです" + \
+                      (f"（「{'」「'.join(x + '弁当' for x in miss)}」がありません）" if miss else "") + \
+                      (f"（「{'」「'.join(x + '弁当' for x in extra)}」は{'贅沢なし版には不要' if '贅沢' in extra and not pdf.zeitaku else '余分'}です）" if extra else "")
+            add("高", CAT10, None, "", "価格欄の並び", fmt(got_p) or "（なし）", fmt(exp_p), why)
+            mark(CAT10, False)
+
     # ⑨ 個別原稿：店舗情報
     if pdf.individual:
         CAT9 = "⑨店舗情報（個別原稿）"
