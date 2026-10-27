@@ -743,10 +743,16 @@ def _spans(page) -> list:
 def _period_from(text: str):
     """'261023配信261027-1106' → (配信日, 開始日, 終了日)"""
     t = unicodedata.normalize("NFKC", text)
-    m = re.search(r"(\d{2})(\d{2})(\d{2})\s*配信\s*(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})", t)
+    m = re.search(r"(\d{2})(\d{2})(\d{2})\s*配信\s*(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})?(?!\d)", t)
     if not m:
         return None
-    y1, m1, d1, y2, m2, d2, m3, d3 = map(int, m.groups())
+    g = m.groups()
+    y1, m1, d1, y2, m2, d2 = map(int, g[:6])
+    if g[7] is None:  # 「261026-30」のように終わりが日だけ
+        d3 = int(g[6])
+        m3 = m2 if d3 >= d2 else m2 % 12 + 1
+    else:
+        m3, d3 = int(g[6]), int(g[7])
     try:
         start = dt.date(2000 + y2, m2, d2)
         end_y = start.year + (1 if m3 < m2 else 0)
@@ -805,6 +811,10 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     page = doc[0]
     title = (doc.metadata or {}).get("title") or ""
     spans = _spans(page)
+    # 同じ文字が同じ位置に黒と白で重ねてある場合（日付の数字など）は黒い方だけ使う
+    darks = [x for x in spans if not x.white]
+    spans = [x for x in spans if not (x.white and any(
+        d.text == x.text and abs(d.x0 - x.x0) < 1.5 and abs(d.y0 - x.y0) < 1.5 for d in darks))]
     warnings = []
     if len(doc) > 1:
         warnings.append(f"{len(doc)}ページありますが、1ページ目だけをチェックしました")
@@ -1115,7 +1125,8 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         if menu_x is None:
             continue
         body = [x for x in reg if x.x0 >= menu_x - 8 and x.text.strip() != "●"]
-        blines = [l for l in _group_lines(body) if l["spans"][0].x0 <= menu_x + 40]
+        x_limit = menu_x + max(40, (x_hi - menu_x) * 0.6)  # 右寄せの2行目（「おろし煮」など）も拾う
+        blines = [l for l in _group_lines(body) if l["spans"][0].x0 <= x_limit]
         # 日付に一番近い行から、行間が詰まっている範囲だけを採用（欄外の文字を除く）
         if blines:
             k = min(range(len(blines)), key=lambda i: abs(blines[i]["yc"] - s.yc))
@@ -1619,18 +1630,20 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             mark(CAT4, False)
         gd = next((x for x in pdf.days if x.date == d), None)
         md = masters.get(d)
+        # イチオシのメニューはメインのこともサブメインのこともある（どちらかに一致すればOK）
         if gd and gd.items:
-            gmain = next((x[0] for x in gd.items if not x[2]), "")
-            res, _ = compare_text(it.menu, gmain, True)
-            if res == "高":
-                add("高", CAT4, d, wd, "メニュー（注文欄と比較）", it.menu, gmain,
-                    "イチオシ欄のメニューが、注文欄の同じ日のメインと違います：" + diff_note(it.menu, gmain))
+            gitems = [x[0] for x in gd.items if not x[2]][:2]
+            if gitems and all(compare_text(it.menu, g, True)[0] == "高" for g in gitems):
+                add("高", CAT4, d, wd, "メニュー（注文欄と比較）", it.menu, " / ".join(gitems),
+                    "イチオシ欄のメニューが、注文欄の同じ日のメイン・サブメインのどちらとも一致しません：" + diff_note(it.menu, gitems[0]))
                 mark(CAT4, False)
         if md:
-            res, _ = compare_text(it.menu, md.fields.get("main", ""), True)
-            if res != "OK":
-                add(res, CAT4, d, wd, "メニュー（マスタと比較）", it.menu, md.fields.get("main", ""),
-                    "イチオシ欄のメニューが、月別マスタのmain列と違います：" + diff_note(it.menu, md.fields.get("main", "")))
+            cands = [(f, md.fields.get(f, "")) for f in ("main", "submain") if md.fields.get(f, "").strip()]
+            results = [(f, v, compare_text(it.menu, v, True)) for f, v in cands]
+            if results and not any(r[0] == "OK" for _, _, r in results):
+                f, v, (res, _) = min(results, key=lambda x: SEV_ORDER.get(x[2][0], 9))
+                add(res, CAT4, d, wd, "メニュー（マスタと比較）", it.menu, v,
+                    f"イチオシ欄のメニューが、月別マスタのmain列・submain列のどちらとも一致しません（近いのは{f}列）：" + diff_note(it.menu, v))
                 mark(CAT4, False)
             exp_t = md.icon_type
             if it.type and exp_t and it.type != exp_t:
