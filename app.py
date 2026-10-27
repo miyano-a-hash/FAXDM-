@@ -674,6 +674,7 @@ class PdfDay:
     icon_how: str = ""
     icon_name: str = ""
     rice_marks: list = field(default_factory=list)
+    frame_icons: list = field(default_factory=list)
 
     @property
     def date(self) -> Optional[dt.date]:
@@ -957,6 +958,14 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             right = min(max(rights), col_right(c)) if rights else col_right(c)
             order_x[c] = col_lefts[c] + (right - col_lefts[c]) * 0.66
 
+    # 枠のアイコン用：白か塗りなしで線のある小さい四角
+    frames = []
+    for dr in page.get_drawings():
+        r = dr["rect"]
+        fill = dr.get("fill")
+        if dr.get("color") and (fill is None or min(fill) > 0.9) and 14 <= r.width <= 80 and 6 <= r.height <= 16 \
+                and grid_top < r.y0 < grid_bottom:
+            frames.append(r)
     skip_words = {"個", "備考", "ヘルシー", "デラックス", "贅沢弁当"}
     for d in days:
         top, bot = cell_bounds[id(d)]
@@ -980,6 +989,18 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         if d.icon_name and not d.icon_type:
             d.icon_type = "（判定不可）"
         cell = [s for s in cell if not s.white]
+        # 枠（小さい四角）の中の文字はアイコン（例：「贅沢プレミアム」）。ご飯マークは別扱い
+        framed = [s for s in cell if s.text.strip() not in cfg.rice_words
+                  and any(f.x0 - 1 <= s.xc <= f.x1 + 1 and f.y0 - 1 <= s.yc <= f.y1 + 1 for f in frames)]
+        for s in framed:
+            t = s.text.strip()
+            d.frame_icons.append(t)
+            if not d.icon_type:
+                d.icon_type = TYPE_ALIASES.get(t, "（判定不可）")
+                d.icon_how = "枠"
+                if t not in TYPE_ALIASES:
+                    d.icon_name = d.icon_name or t
+        cell = [s for s in cell if s not in framed]
         # ご飯マーク
         marks = [s for s in cell if s.text.strip() in cfg.rice_words and s.size < 8.5]
         d.rice_marks = [m.text.strip() for m in marks]
@@ -1033,26 +1054,50 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
               and w.y0 < s.y1 and w.y1 > s.y0]
         if wd:
             entries.append((s, wd[0]))
-    entries.sort(key=lambda e: e[0].yc)
+    # 縦並び・横並びのどちらにも対応：同じ高さの日付を1行にまとめ、行の中は左右で区切る
+    entries.sort(key=lambda e: (e[0].yc, e[0].x0))
+    rows_ = []
+    for e in entries:
+        for r in rows_:
+            if abs(r[0][0].yc - e[0].yc) < e[0].size * 0.8:
+                r.append(e)
+                break
+        else:
+            rows_.append([e])
+    for r in rows_:
+        r.sort(key=lambda e: e[0].x0)
+    rows_.sort(key=lambda r: r[0][0].yc)
     split_x = col_lefts[1] if len(col_lefts) > 1 else page_w * 0.5
     type_all = [x for x in spans if x.text.strip() in TYPE_WORDS and x.y0 < grid_top]
-    tops = []
-    for s, w in entries:
-        tl = [x for x in type_all if s.y0 - 35 <= x.y0 <= s.y0 + 5 and x.x0 < s.x1 + 10]
-        tops.append(min(x.y0 for x in tl) - 8 if tl else None)
-    for i, (s, w) in enumerate(entries):
-        if tops[i] is not None:
-            top = tops[i]
-        elif i == 0:
-            top = s.y0 - 45
+
+    def _type_top(s):
+        tl = [x for x in type_all if s.y0 - 35 <= x.y0 <= s.y0 + 5 and x.x0 < s.x1 + 10 and x.x1 > s.x0 - 40]
+        return min(x.y0 for x in tl) - 8 if tl else None
+
+    row_tops = []
+    for r in rows_:
+        tt = [t for t in (_type_top(e[0]) for e in r) if t is not None]
+        row_tops.append(min(tt) if tt else None)
+    plan = []
+    for ri, r in enumerate(rows_):
+        s0 = r[0][0]
+        if row_tops[ri] is not None:
+            top = row_tops[ri]
+        elif ri == 0:
+            top = s0.y0 - 45
         else:
-            top = (entries[i - 1][0].y0 + s.y0) / 2 - 5
-        if i + 1 < len(entries):
-            nxt = entries[i + 1][0]
-            bot = tops[i + 1] if tops[i + 1] is not None else (s.y0 + nxt.y0) / 2 - 5
+            top = (rows_[ri - 1][0][0].y0 + s0.y0) / 2 - 5
+        if ri + 1 < len(rows_):
+            nx = rows_[ri + 1][0][0]
+            bot = row_tops[ri + 1] if row_tops[ri + 1] is not None else (s0.y0 + nx.y0) / 2 - 5
         else:
-            bot = min(s.y1 + 45, grid_top)
-        reg = [x for x in spans if top <= x.yc < bot and x.x0 < split_x and x is not s and x is not w and x.y0 < grid_top]
+            bot = min(max(e[0].y1 for e in r) + 45, grid_top)
+        for ci, (s, w) in enumerate(r):
+            x_lo = s.x0 - 15 if ci > 0 else 0
+            x_hi = r[ci + 1][0].x0 - 15 if ci + 1 < len(r) else split_x
+            plan.append((s, w, top, bot, x_lo, x_hi))
+    for (s, w, top, bot, x_lo, x_hi) in plan:
+        reg = [x for x in spans if top <= x.yc < bot and x_lo <= x.x0 < x_hi and x is not s and x is not w and x.y0 < grid_top]
         pref = [p for p in reg if p.din and p.text.strip().isdigit() and p.x1 <= s.x0 + 1 and s.x0 - p.x1 < 25
                 and abs(p.yc - s.yc) < s.size]
         month = int(pref[0].text.strip()) if pref else None
@@ -1479,6 +1524,9 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                         f"マスタのラベル列が「{md.label}」なので「{md.rice_word}」マークが必要ですが、PDFのこの日の欄にありません")
                     mark(CAT6, False)
             for mk in d.rice_marks:
+                if md.icon_type == "贅沢プレミアム" and not md.rice_word:
+                    used_rice_words.add(mk)  # 贅沢プレの日はご飯マークがあってもOK（注記のチェックは行う）
+                    continue
                 if mk != md.rice_word and not (md.rice_word and md.rice_word not in d.rice_marks):
                     add("中", CAT6, d.date, wd, "ご飯マーク", mk, md.rice_word or "（なし）",
                         f"PDFに「{mk}」マークがありますが、マスタのラベル列は「{md.label or '空欄'}」です")
