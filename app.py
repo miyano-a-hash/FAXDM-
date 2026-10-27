@@ -730,6 +730,7 @@ class PdfDoc:
     qr_note: str = ""
     order_headers: list = field(default_factory=list)  # 注文欄ごとの見出し（左から）
     price_labels: list = field(default_factory=list)   # 価格欄の弁当名（上から・左から）
+    menu_only: bool = False                         # メニュー名だけ照合するレイアウト（2週間分ヨコ・オリジナル など）
 
     @property
     def individual(self) -> bool:
@@ -836,6 +837,9 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     # --- グリッド（注文欄）の位置 ---
     headers = sorted([s for s in spans if re.match(r"^\s*\d{4}\s*年", s.text)], key=lambda s: s.x0)
     if not headers:
+        simple = _read_pdf_simple(page, name, title, period, warnings, fulltext)
+        if simple:
+            return simple
         raise ValueError("注文欄の見出し（2026 年◯月）が見つかりません")
     grid_top = min(h.y0 for h in headers)
     col_lefts = [h.x0 for h in headers]
@@ -881,6 +885,9 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         used.update({id(s), id(w)})
         days.append(pd_)
     if not days:
+        simple = _read_pdf_simple(page, name, title, period, warnings, fulltext)
+        if simple:
+            return simple
         raise ValueError("注文欄の日付を読み取れませんでした")
 
     # 年月の割り当て（見出しの月から順に、日が戻ったら翌月）
@@ -1182,6 +1189,231 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
                   grid_top, phrases, store, prices, qr_urls, qr_note, order_headers, price_labels)
 
 
+# ----------------------------------------------------------------------------
+# その他のレイアウト（2週間分ヨコ・オリジナル縦型・カレー入り など）：メニュー欄だけ読む
+# ----------------------------------------------------------------------------
+MENU_ONLY_NOTE = "このレイアウトは、①曜日・②メニュー名（贅沢ありは「こだわりの逸品」）・⑦掲載日・期間・⑨店舗情報（住所・TEL・FAX・価格・QR）を照合しました。アイコン・イチオシ・定型文言・見出しの並びは照合していません"
+ZEITAKU_PREFIX = "こだわりの逸品"
+
+
+def _page_lines(page) -> list:
+    out = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            sp = [x for x in l["spans"] if x["text"].strip()]
+            if not sp:
+                continue
+            out.append(dict(t="".join(x["text"] for x in sp),
+                            x0=min(x["bbox"][0] for x in sp), y0=min(x["bbox"][1] for x in sp),
+                            x1=max(x["bbox"][2] for x in sp), y1=max(x["bbox"][3] for x in sp),
+                            size=max(x["size"] for x in sp)))
+    return out
+
+
+def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fulltext: str) -> Optional[PdfDoc]:
+    """日付が「26㊊」「11/2」のように1つの文字列で入っているレイアウト。
+    日付の右にあるメニュー欄の行を、日付ごとに集めて PdfDay にする。"""
+    L = _page_lines(page)
+    wd_re = "[" + "".join(WEEKDAY_CHARS) + "]"
+    anchors = [l for l in L if l["size"] >= 14 and re.match(r"^(\d{1,2}/)?\d{1,2}" + wd_re + "?$", l["t"].replace(" ", ""))]
+    if len(anchors) < 2:
+        return None
+    anchors.sort(key=lambda a: a["y0"])
+    # 年と最初の月：注文欄の見出し（2026年10月/11月）→ ファイル名の期間
+    year, cur_m = None, None
+    for l in L:
+        t = unicodedata.normalize("NFKC", l["t"]).replace(" ", "")
+        mm = re.match(r"^(\d{4})年(\d{1,2})月", t)
+        if mm:
+            year, cur_m = int(mm.group(1)), int(mm.group(2))
+            break
+    if year is None and period:
+        year, cur_m = period[1].year, period[1].month
+    if year is None:
+        today = dt.date.today()
+        year, cur_m = today.year, today.month
+
+    page_w = page.rect.width
+    kos = [l["x0"] for l in L if l["t"].strip() == "個"]
+    cs = [(a["y0"] + a["y1"]) / 2 for a in anchors]
+    h = min(b - a for a, b in zip(cs, cs[1:]))
+    # メニュー欄の左端（日付の右にある行の左端で一番多いもの）
+    lefts = []
+    for i, a in enumerate(anchors):
+        near = [l for l in L if abs((l["y0"] + l["y1"]) / 2 - cs[i]) < h / 2 and l["x0"] > a["x1"] - 2 and l["size"] < 12]
+        if near:
+            lefts.append(round(min(x["x0"] for x in near)))
+    menu_x = max(set(lefts), key=lefts.count) if lefts else 0
+    xmax = menu_x + page_w * 0.35
+    if kos:
+        xmax = min(xmax, min(kos) - 3)
+
+    days = []
+    prev = None
+    zeitaku_any = False
+    for i, a in enumerate(anchors):
+        t = a["t"].replace(" ", "")
+        mm = re.match(r"^(?:(\d{1,2})/)?(\d{1,2})(" + wd_re + ")?", t)
+        day = int(mm.group(2))
+        if mm.group(1):
+            cur_m = int(mm.group(1))
+        elif prev is not None and day < prev:
+            cur_m += 1
+        if cur_m > 12:
+            cur_m, year = 1, year + 1
+        prev = day
+        top, bot = cs[i] - h / 2, cs[i] + h / 2
+        band = [l for l in L if l is not a and top <= (l["y0"] + l["y1"]) / 2 < bot]
+        wd = mm.group(3) or next((l["t"].strip() for l in band if l["t"].strip() in WEEKDAY_CHARS
+                                  and l["x0"] < menu_x and l["x0"] > a["x0"] - 5), "")
+        ls = sorted([l for l in band if l["size"] < 12 and l["x0"] >= a["x1"] - 2 and l["x0"] < xmax],
+                    key=lambda l: (round(l["y0"]), l["x0"]))
+        pd_ = PdfDay(day=day, month=cur_m, year=year, weekday_char=wd, yc=cs[i], top=top)
+        mains, sides, zei = [], [], []
+        mode = "side"
+        for l in ls:
+            tx = l["t"].strip()
+            if tx in RICE_WORDS:
+                pd_.rice_marks.append(tx)
+                continue
+            if "●" in tx:
+                mains += [x.strip() for x in tx.split("●") if x.strip()]
+            elif tx.startswith(ZEITAKU_PREFIX):
+                mode = "zei"
+                rest = re.sub("^" + ZEITAKU_PREFIX + "[：:]?", "", tx).strip()
+                if rest:
+                    zei.append(rest)
+            elif mode == "zei":
+                zei.append(tx)
+            elif "／" in tx and not mains and not sides:
+                mains += [x.strip() for x in tx.split("／") if x.strip()]
+            else:
+                sides.append(tx.replace("／", "/"))
+        pd_.items = [(m_, False, False) for m_ in mains]
+        pd_.side_lines = sides
+        pd_.sides_raw = " ".join(sides)
+        pd_.sides = [x.strip() for x in "".join(sides).split("/") if x.strip()]
+        if zei:
+            zeitaku_any = True
+            pd_.zeitaku_lines = zei
+            buf = ""
+            for z in zei:
+                if buf and not buf.rstrip().endswith("/") and not z.startswith("/"):
+                    buf += "\n"
+                buf += z
+            pd_.zeitaku_has_slash = "/" in buf
+            pd_.zeitaku = [(x.replace("\n", "").strip(), "\n" in x.strip()) for x in buf.split("/") if x.strip()]
+        days.append(pd_)
+    if not any(d.items for d in days):
+        return None
+    days.sort(key=lambda d: d.date or dt.date.min)
+    if period is None:  # 「261027-1109_個別カレー入り_弁慶」のように配信日がないファイル名
+        period = _period_no_send(name) or _period_no_send(title)
+    # 注文欄（日付・メニュー）の範囲。価格・店舗欄を探すときはここを除く
+    grid = (min(a["x0"] for a in anchors) - 5, anchors[0]["y0"] - h * 0.6, page_w, anchors[-1]["y1"] + h * 0.6)
+    outside = [l for l in L if not (l["x1"] > grid[0] and grid[1] < l["y1"] and l["y0"] < grid[3])]
+    store = _simple_store(L, outside)
+    prices = _simple_prices(outside)
+    qr_urls, qr_note = _read_qr(page)
+    warnings = list(warnings) + [MENU_ONLY_NOTE]
+    return PdfDoc(name, title, zeitaku_any, period, days, [], fulltext, "", warnings,
+                  store=store, prices=prices, qr_urls=qr_urls, qr_note=qr_note, menu_only=True)
+
+
+def _period_no_send(text: str):
+    t = unicodedata.normalize("NFKC", text or "")
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})(?!\d)", t)
+    if not m:
+        return None
+    y, m1, d1, m2, d2 = map(int, m.groups())
+    try:
+        start = dt.date(2000 + y, m1, d1)
+        return None, start, dt.date(start.year + (1 if m2 < m1 else 0), m2, d2)
+    except ValueError:
+        return None
+
+
+PREF_RE = re.compile(r"(北海道|東京都|大阪府|京都府|\S{2,3}県)\S*?[市区町村郡]")
+
+
+def _simple_store(L: list, outside: list) -> dict:
+    """店舗欄（店舗名・住所・TEL・FAX）を読む：住所の行を起点に、その上（または左）を店舗名とみる"""
+    out = {}
+    addr = None
+    for l in outside:
+        t = unicodedata.normalize("NFKC", l["t"])
+        m = PREF_RE.search(t)
+        if m and not re.match(r"^\s*(ご)?住所", t):
+            addr, pre = l, t[:m.start()].strip()
+            out["address"] = fix_extract(t[m.start():])
+            if len(pre) >= 2:
+                out["name"] = fix_extract(pre)
+            break
+    if addr is not None and "name" not in out:
+        bad = ("TEL", "FAX", "WEB", "注文", "QR", "LINE", "お問")
+        cands = [l for l in outside if l is not addr and addr["y0"] - 45 <= l["y0"] and (l["y0"] + l["y1"]) / 2 < addr["y0"]
+                 and abs(l["x0"] - addr["x0"]) < 40 and l["size"] >= 11
+                 and not PHONE_RE.search(unicodedata.normalize("NFKC", l["t"])) and not any(k in l["t"] for k in bad)]
+        if cands:
+            out["name"] = fix_extract(" ".join(l["t"].strip() for l in sorted(cands, key=lambda l: l["y0"])))
+    # 電話：TELの文字と同じ行（または同じ高さの右側）の番号
+    phones = []
+    for l in outside:
+        mm = PHONE_RE.search(unicodedata.normalize("NFKC", l["t"]))
+        if mm and mm.group(1) not in COMMON_PHONES:
+            phones.append((l, mm.group(1)))
+    for l in outside:
+        t = unicodedata.normalize("NFKC", l["t"]).upper()
+        if "TEL" not in t:
+            continue
+        mm = PHONE_RE.search(t)
+        if mm and mm.group(1) not in COMMON_PHONES:
+            out["tel"] = mm.group(1)
+            break
+        yc = (l["y0"] + l["y1"]) / 2
+        near = [(pl, ph) for pl, ph in phones if pl["x0"] > l["x0"] and pl["x0"] - l["x1"] < 150
+                and abs((pl["y0"] + pl["y1"]) / 2 - yc) < 15]
+        if near:
+            out["tel"] = min(near, key=lambda x: x[0]["x0"])[1]
+            break
+    rest = [(pl, ph) for pl, ph in phones if ph != out.get("tel")]
+    if rest:
+        out["fax"] = max(rest, key=lambda x: x[0]["size"])[1]
+    return out
+
+
+def _simple_prices(outside: list) -> dict:
+    """価格欄（「ヘルシー弁当 450円」など）を読む。数字は同じ行・右側・すぐ下のどれかにある"""
+    out = {}
+    nums = []
+    for l in outside:
+        mm = re.match(r"^\s*([\d,]{3,5})\s*(円.*)?$", unicodedata.normalize("NFKC", l["t"]))
+        if mm:
+            nums.append((l, int(mm.group(1).replace(",", ""))))
+    for l in sorted(outside, key=lambda l: (l["y0"], l["x0"])):
+        t = unicodedata.normalize("NFKC", l["t"]).replace(" ", "").replace("\u3000", "").lstrip("●・")
+        if "弁当" not in t or "弁当に" in t:
+            continue
+        lab = "南蛮" if "南蛮" in t else next((k for k in PRICE_COLUMNS if t.startswith(k)), None)
+        if lab is None and t.startswith("から揚げ"):
+            lab = "唐揚げ"
+        if not lab or lab in out or not t.startswith(lab if lab != "南蛮" else t[:1]):
+            continue
+        mm = re.search(r"弁当[^\d]{0,3}([\d,]{3,5})円?", t)
+        if mm:
+            out[lab] = int(mm.group(1).replace(",", ""))
+            continue
+        yc = (l["y0"] + l["y1"]) / 2
+        right = [(nl, v) for nl, v in nums if nl["x0"] > l["x0"] and nl["x0"] - l["x1"] < 200
+                 and abs((nl["y0"] + nl["y1"]) / 2 - yc) < 12]
+        below = [(nl, v) for nl, v in nums if (nl["y0"] + nl["y1"]) / 2 > yc + 4 and nl["y0"] - l["y1"] < 30
+                 and nl["x0"] < l["x1"] + 80 and nl["x1"] > l["x0"] - 10]
+        hit = min(right, key=lambda x: x[0]["x0"]) if right else (min(below, key=lambda x: x[0]["y0"]) if below else None)
+        if hit:
+            out[lab] = hit[1]
+    return out
+
+
 def _read_order_headers(page, spans, headers, col_lefts, col_right) -> list:
     """注文欄ごとに、見出しの並び（左から）を読む。文字でも図形でも対応"""
     drawings = page.get_drawings()
@@ -1382,6 +1614,11 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
         if not (pv or mv):
             continue
         if _digits(pv) != _digits(mv):
+            if pdf.menu_only and not pv:  # このレイアウトは番号が図形（アウトライン）のことがある
+                add("中", cat, None, "", lab, "（読み取れず）", mv,
+                    f"PDFの店舗欄に{lab}が文字として見つかりません。載っていないか、文字が図形化されていて読めない可能性があります（原稿を目視確認）［{ref}］")
+                mark(cat, False)
+                continue
             why = (f"PDFの店舗欄に{lab}が見当たりません" if not pv else
                    f"マスタの{col}が空欄です" if not mv else
                    f"PDFの{lab}がマスタの{col}と違います")
@@ -1395,15 +1632,15 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
                    "唐揚げ価格": "N列（唐揚げ価格）", "南蛮価格": "O列（南蛮価格）"}.get(col, col)
         if pv is not None and mv is None:
             add("中", cat, None, "", name, f"{pv}円", "（マスタは空欄）",
-                f"PDFの右上に{lab}弁当の価格がありますが、マスタの{colname}が空欄で照合できません［{ref}］")
+                f"PDFの価格欄に{lab}弁当の価格がありますが、マスタの{colname}が空欄で照合できません［{ref}］")
             mark(cat, False)
         elif pv is not None and pv != mv:
             add("高", cat, None, "", name, f"{pv}円", f"{mv}円",
-                f"PDFの右上の{lab}弁当の価格が、マスタの{colname}と違います［{ref}］")
+                f"PDFの価格欄の{lab}弁当の価格が、マスタの{colname}と違います［{ref}］")
             mark(cat, False)
         elif pv is None and mv is not None and (lab in ("ヘルシー", "デラックス") or (lab == "贅沢" and pdf.zeitaku)):
             add("高", cat, None, "", name, "（記載なし）", f"{mv}円",
-                f"マスタの{colname}に価格がありますが、PDFの右上の価格欄に{lab}弁当が見当たりません［{ref}］")
+                f"マスタの{colname}に価格がありますが、PDFの価格欄に{lab}弁当が見当たりません［{ref}］")
             mark(cat, False)
     # 贅沢の契約と版
     if row.zeitaku and not pdf.zeitaku:
@@ -1799,6 +2036,10 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         else:
             _check_store(pdf, stores, add, mark, CAT9)
 
+    if pdf.menu_only:  # メニュー欄だけ照合するレイアウト
+        keep = [CAT1, CAT2, CAT7] + [k for k in status if k.startswith("⑨")]
+        F = [f for f in F if f.category in keep]
+        status = {k: v for k, v in status.items() if k in keep}
     F.sort(key=lambda f: (SEV_ORDER.get(f.severity, 9), f.category, f.date))
     return F, status
 
