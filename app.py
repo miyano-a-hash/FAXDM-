@@ -1379,6 +1379,11 @@ def _simple_store(L: list, outside: list) -> dict:
     rest = [(pl, ph) for pl, ph in phones if ph != out.get("tel")]
     if rest:
         out["fax"] = max(rest, key=lambda x: x[0]["size"])[1]
+    # 「※ご注文は上記QRコードを読み取りWEBから」のようにWEB注文だけの原稿（肉まる など）はFAX番号を載せない
+    for l in outside:
+        t = unicodedata.normalize("NFKC", l["t"]).replace(" ", "").upper()
+        if "ご注文は" in t and ("QR" in t or "WEB" in t) and "FAX" not in t:
+            out["web_only"] = True
     return out
 
 
@@ -1614,6 +1619,13 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
         if not (pv or mv):
             continue
         if _digits(pv) != _digits(mv):
+            if pdf.menu_only and not pv and lab == "FAX番号" and ps.get("web_only"):
+                continue  # WEB注文だけの原稿はFAX番号を載せない（問題なし）
+            if pdf.menu_only and not pv and lab == "FAX番号":
+                # 指摘にはせず、照合できなかったことをメッセージで知らせる（間違っていても気付けるように）
+                pdf.warnings.append(f"FAX番号が図形化されていて文字として読めないため、照合していません。"
+                                    f"原稿のFAX番号を目視で確認してください（マスタのF列：{mv}）［{ref}］")
+                continue
             if pdf.menu_only and not pv:  # このレイアウトは番号が図形（アウトライン）のことがある
                 add("中", cat, None, "", lab, "（読み取れず）", mv,
                     f"PDFの店舗欄に{lab}が文字として見つかりません。載っていないか、文字が図形化されていて読めない可能性があります（原稿を目視確認）［{ref}］")
