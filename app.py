@@ -129,6 +129,31 @@ def describe_ws(s: str) -> str:
     return s.replace("　", "［全角空白］").replace(" ", "［半角空白］") if s else s
 
 
+def diff_note(pdf: str, master: str, max_parts: int = 3) -> str:
+    """PDFとマスタの違いを「どこがどう違うか」の文章にする（空白は無視）"""
+    import difflib
+    a, b = no_ws(fix_extract(pdf or "")), no_ws(master or "")
+    if not a:
+        return "PDFに記載がありません"
+    if not b:
+        return "マスタが空欄です"
+    parts = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        pa, mb = a[i1:i2], b[j1:j2]
+        if op == "insert":
+            parts.append(f"マスタにある「{mb}」がPDFにありません")
+        elif op == "delete":
+            parts.append(f"PDFに「{pa}」が余分に入っています")
+        else:  # 前後1文字を足して、どこの話か分かるようにする
+            lo, hi = a[max(i1 - 1, 0):i1], a[i2:i2 + 1]
+            parts.append(f"PDFは「{lo}{pa}{hi}」、マスタは「{lo}{mb}{hi}」")
+    if len(parts) > max_parts:
+        return "表記が大きく違います（" + "／".join(parts[:max_parts]) + " ほか）"
+    return "／".join(parts)
+
+
 def compare_text(pdf: str, master: str, wrapped: bool = False):
     """戻り値: (判定, 説明)  判定は 'OK' / '低' / '高'"""
     p = fix_extract(pdf or "")
@@ -138,12 +163,12 @@ def compare_text(pdf: str, master: str, wrapped: bool = False):
     if no_ws(p) == no_ws(m):
         if wrapped:
             return "OK", ""
-        return "低", "スペースの種類・有無だけの差（原稿を目視確認）"
+        return "低", "文字はマスタと同じですが、スペースの種類（全角／半角）や有無が違います（原稿を目視確認）"
     if loose(p) == loose(m):
-        return "低", "「～」と「〜」など記号の字形差"
+        return "低", "文字はマスタと同じですが、「～」と「〜」など記号の字形が違います（原稿を目視確認）"
     if unicodedata.normalize("NFKC", no_ws(p)) == unicodedata.normalize("NFKC", no_ws(m)):
-        return "高", "全角・半角の違い（括弧「（）」と「()」など）"
-    return "高", ""
+        return "高", "全角・半角の違いがあります（" + diff_note(p, m) + "）"
+    return "高", diff_note(p, m)
 
 
 
@@ -1215,48 +1240,63 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
     row, how = find_store(ps, stores)
     if row is None:
         add("高", cat, None, "", "店舗名", ps.get("name", ""), "（マスタに該当なし）",
-            "店舗マスタの正式店舗名（D列）に見つかりません")
+            "PDF下部の店舗名が、店舗マスタのD列（正式店舗名）・C列（店舗名）のどちらにも見つからず、電話・FAX番号でも特定できません")
         mark(cat, False)
         return
-    ref = f"{row.official}（{row.row}行目）"
+    ref = f"店舗マスタ {row.row}行目（{row.official}）"
     if how != "正式店舗名":
         add("中", cat, None, "", "店舗名", ps.get("name", ""), row.official,
-            f"正式店舗名と一致しません（{how}で特定：{row.row}行目）")
+            f"PDF下部の店舗名がマスタのD列（正式店舗名）と完全には一致しません。{how}で店舗を特定しました［{ref}］")
         mark(cat, False)
     # 住所
     if row.address or ps.get("address"):
         if _norm_key(ps.get("address", "")) != _norm_key(row.address):
+            why = ("PDFの住所が見当たりません" if not ps.get("address") else
+                   "マスタのG列（記載住所）が空欄です" if not row.address else
+                   "PDFの住所がマスタのG列（記載住所）と違います（番地・建物名・部屋番号などを確認）")
             add("高", cat, None, "", "住所", ps.get("address", "（なし）"), row.address or "（マスタは空欄）",
-                ("マスタ備考：" + row.address_note) if row.address_note else ref)
+                why + f"［{ref}］" + (f"　マスタ備考：{row.address_note}" if row.address_note else ""))
             mark(cat, False)
         elif row.address_note:
-            add("情報", cat, None, "", "住所", ps.get("address", ""), row.address, "マスタ備考：" + row.address_note)
+            add("情報", cat, None, "", "住所", ps.get("address", ""), row.address,
+                f"住所は一致していますが、マスタのG列にメモがあります：{row.address_note}［{ref}］")
     # 電話・FAX
-    for lab, pv, mv in (("電話番号", ps.get("tel", ""), row.tel), ("FAX番号", ps.get("fax", ""), row.fax)):
+    for lab, col, pv, mv in (("電話番号", "E列（記載用電話番号）", ps.get("tel", ""), row.tel),
+                             ("FAX番号", "F列（記載用FAX番号）", ps.get("fax", ""), row.fax)):
         if not (pv or mv):
             continue
         if _digits(pv) != _digits(mv):
-            add("高", cat, None, "", lab, pv or "（なし）", mv or "（マスタは空欄）", ref)
+            why = (f"PDFの店舗欄に{lab}が見当たりません" if not pv else
+                   f"マスタの{col}が空欄です" if not mv else
+                   f"PDFの{lab}がマスタの{col}と違います")
+            add("高", cat, None, "", lab, pv or "（なし）", mv or "（マスタは空欄）", f"{why}［{ref}］")
             mark(cat, False)
     # 価格
     for lab, col in PRICE_COLUMNS.items():
         pv, mv = pdf.prices.get(lab), row.prices.get(lab)
         name = f"{lab}弁当の価格"
+        colname = {"DX価格": "K列（DX価格）", "HC価格": "L列（HC価格）", "贅沢価格": "M列（贅沢価格）",
+                   "唐揚げ価格": "N列（唐揚げ価格）", "南蛮価格": "O列（南蛮価格）"}.get(col, col)
         if pv is not None and mv is None:
-            add("中", cat, None, "", name, f"{pv}円", f"（マスタの{col}は空欄）", ref)
+            add("中", cat, None, "", name, f"{pv}円", "（マスタは空欄）",
+                f"PDFの右上に{lab}弁当の価格がありますが、マスタの{colname}が空欄で照合できません［{ref}］")
             mark(cat, False)
         elif pv is not None and pv != mv:
-            add("高", cat, None, "", name, f"{pv}円", f"{mv}円", f"マスタ：{col}")
+            add("高", cat, None, "", name, f"{pv}円", f"{mv}円",
+                f"PDFの右上の{lab}弁当の価格が、マスタの{colname}と違います［{ref}］")
             mark(cat, False)
         elif pv is None and mv is not None and (lab in ("ヘルシー", "デラックス") or (lab == "贅沢" and pdf.zeitaku)):
-            add("高", cat, None, "", name, "（記載なし）", f"{mv}円", "価格欄に見当たりません")
+            add("高", cat, None, "", name, "（記載なし）", f"{mv}円",
+                f"マスタの{colname}に価格がありますが、PDFの右上の価格欄に{lab}弁当が見当たりません［{ref}］")
             mark(cat, False)
     # 贅沢の契約と版
     if row.zeitaku and not pdf.zeitaku:
-        add("中", cat, None, "", "版", "贅沢なし", "贅沢あり", "店舗マスタでは贅沢ありの店舗です")
+        add("中", cat, None, "", "版", "贅沢なし", "贅沢あり",
+            f"マスタのJ列が「贅沢」（贅沢ありの店舗）ですが、PDFは贅沢なし版です［{ref}］")
         mark(cat, False)
     elif pdf.zeitaku and not row.zeitaku and "贅沢" in pdf.prices:
-        add("中", cat, None, "", "版", "贅沢あり", "贅沢なし", "店舗マスタでは贅沢の印がありません")
+        add("中", cat, None, "", "版", "贅沢あり", "贅沢なし",
+            f"PDFは贅沢あり版ですが、マスタのJ列に「贅沢」の印がありません［{ref}］")
         mark(cat, False)
     # QRコード
     if pdf.qr_note:
@@ -1265,13 +1305,15 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
     own = [u for u in pdf.qr_urls if not any(c in u for c in COMMON_QR)]
     if row.qr and not own:
         add("高", cat, None, "", "QRコードのリンク", "（店舗のQRコードなし）", row.qr,
-            "店舗のQRコードが見つからないか、読み取れませんでした")
+            f"マスタのW列（QRコード用URL）にリンクがありますが、PDFに店舗のQRコードが見つからないか読み取れませんでした［{ref}］")
         mark(cat, False)
     elif own and not row.qr:
-        add("中", cat, None, "", "QRコードのリンク", " / ".join(own), "（マスタのW列は空欄）", ref)
+        add("中", cat, None, "", "QRコードのリンク", " / ".join(own), "（マスタは空欄）",
+            f"PDFに店舗のQRコードがありますが、マスタのW列（QRコード用URL）が空欄で照合できません［{ref}］")
         mark(cat, False)
     elif own and _norm_url(row.qr) not in {_norm_url(u) for u in own}:
-        add("高", cat, None, "", "QRコードのリンク", " / ".join(own), row.qr, "QRコードのリンク先がマスタと違います")
+        add("高", cat, None, "", "QRコードのリンク", " / ".join(own), row.qr,
+            f"PDFのQRコードを読み取ったリンク先が、マスタのW列（QRコード用URL）と違います［{ref}］")
         mark(cat, False)
 
 
@@ -1280,6 +1322,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
     status = {}
 
     def add(sev, cat, d, wd, item, p, m, note=""):
+        if not note:  # 念のため：理由が空のまま出さない
+            note = f"PDFの{item}がマスタと一致しません" if m else f"PDFの{item}を確認してください"
         F.append(Finding(sev, cat, fmt_date(d), wd, item, p, m, note))
 
     def mark(cat, ok, detail=""):
@@ -1298,13 +1342,14 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
     # ① 曜日
     for d in pdf.days:
         if d.date is None:
-            add("高", CAT1, None, d.weekday_char, "日付", f"{d.month}/{d.day}", "", "存在しない日付です")
+            add("高", CAT1, None, d.weekday_char, "日付", f"{d.month}/{d.day}", "", "カレンダーに存在しない日付です（月の読み取り結果も確認してください）")
             mark(CAT1, False)
             continue
         exp = d.date.weekday()
         got = WEEKDAY_CHARS.get(d.weekday_char)
         if got != exp:
-            add("高", CAT1, d.date, d.weekday_char, "曜日", d.weekday_char, WEEKDAY_JA[exp], "日付と曜日が合っていません")
+            add("高", CAT1, d.date, d.weekday_char, "曜日", d.weekday_char, WEEKDAY_JA[exp],
+                f"{fmt_date(d.date)}は{WEEKDAY_JA[exp]}曜日ですが、注文欄の曜日が「{d.weekday_char}」になっています")
             mark(CAT1, False)
 
     # ② メニュー名 ③ アイコン ⑥ ご飯
@@ -1313,7 +1358,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         md: Optional[MasterDay] = masters.get(d.date)
         wd = d.weekday_char
         if md is None:
-            add("高", CAT7, d.date, wd, "日付", f"{fmt_date(d.date)}", "", "マスタにこの日付がありません")
+            add("高", CAT7, d.date, wd, "日付", f"{fmt_date(d.date)}", "",
+                f"PDFに{fmt_date(d.date)}がありますが、月別マスタ（day列）にこの日付がありません")
             mark(CAT7, False)
             continue
         # メニュー
@@ -1326,7 +1372,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         if len(items) >= 2:
             pdf_vals["submain"] = (items[1][0], items[1][1])
         for it in items[2:]:
-            add("中", CAT2, d.date, wd, "メニュー行", it[0], "", "メイン・サブメイン以外の「●」行があります")
+            add("中", CAT2, d.date, wd, "メニュー行", it[0], "",
+                "この日の欄に「●」の行が3つ以上あり、メイン・サブメインのどちらにも当てはまらない行があります")
             mark(CAT2, False)
         if not pdf.zeitaku:
             mvals = [md.fields.get(f, "") for f in ["fukusai1", "fukusai2", "salad"]]
@@ -1337,11 +1384,11 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                 d.sides = [x[0] for x in sides]
             if by_break:
                 add("低", CAT2, d.date, wd, "副菜・サラダ", " / ".join(d.side_lines), " / ".join(mvals),
-                    "区切りの「/」がなく改行で区切られている箇所があります")
+                    "副菜・サラダは「/」で区切る決まりですが、「/」がなく改行だけで区切られている箇所があります（内容はマスタと一致）")
                 mark(CAT2, False)
             elif sides and len(sides) != 3:
                 add("中", CAT2, d.date, wd, "副菜・サラダ", d.sides_raw, " / ".join(mvals),
-                    f"「/」区切りが{len(sides)}項目です（3項目のはず）")
+                    f"副菜2種とサラダの3つを「/」で区切る決まりですが、{len(sides)}つに分かれています（区切りの抜けや余分な「/」がないか確認）")
                 mark(CAT2, False)
             fields = MENU_FIELDS
         else:
@@ -1356,7 +1403,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                     pdf_vals["zeitaku1"] = (z1, True)
                     pdf_vals["zeitaku2"] = (z2, True)
                     add("低", CAT2, d.date, wd, "贅沢弁当", joined, f"{z1} / {z2}",
-                        "贅沢弁当1と2の間に区切りの「/」がありません（他の日は「/」区切り）")
+                        "この原稿の他の日は贅沢弁当1と2を「/」で区切っていますが、この日だけ「/」がありません（内容はマスタと一致）")
                     mark(CAT2, False)
             if not any(x.zeitaku_has_slash for x in pdf.days) and len(d.zeitaku_lines) >= 2 \
                     and md.fields.get("zeitaku2", "").strip():
@@ -1375,23 +1422,27 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             pv = pdf_vals.get(f)
             if pv is None:
                 if mv.strip():
-                    add("高", CAT2, d.date, wd, FIELD_JA[f], "（記載なし）", mv, "PDFに見当たりません")
+                    add("高", CAT2, d.date, wd, FIELD_JA[f], "（記載なし）", mv,
+                        f"月別マスタの{f}列にある「{mv.strip()}」が、PDFのこの日の欄に見当たりません")
                     mark(CAT2, False)
                 continue
             if not mv.strip():
-                add("高", CAT2, d.date, wd, FIELD_JA[f], pv[0], "（マスタは空欄）", "マスタにない項目です")
+                add("高", CAT2, d.date, wd, FIELD_JA[f], pv[0], "（マスタは空欄）",
+                    f"PDFに記載がありますが、月別マスタの{f}列が空欄です")
                 mark(CAT2, False)
                 continue
             res, note = compare_text(pv[0], mv, pv[1])
             if res != "OK":
                 add(res, CAT2, d.date, wd, FIELD_JA[f], describe_ws(fix_extract(pv[0])) if res == "低" else fix_extract(pv[0]),
-                    describe_ws(mv.strip()) if res == "低" else mv.strip(), note)
+                    describe_ws(mv.strip()) if res == "低" else mv.strip(),
+                    f"月別マスタの{f}列と一致しません：{note}" if res == "高" else note)
                 mark(CAT2, False)
         for it in extra:
             row_texts = [md.memo] + list(md.fields.values())
             hit = any(it[0] and no_ws(it[0]) in no_ws(t) for t in row_texts if t)
             add("情報", CAT2, d.date, wd, "ご飯マーク付きの行", it[0],
-                md.memo or "", "マスタの行内（メモ列など）に記載あり" if hit else "マスタの行内に見当たりません")
+                md.memo or "", ("ご飯マーク付きの行はメニュー列の対象外のため参考表示です（マスタの同じ行のメモ等に記載あり）" if hit
+                                else "ご飯マーク付きの行がありますが、月別マスタの同じ行のどこにも見当たりません"))
             if not hit:
                 mark(CAT2, False)
 
@@ -1404,7 +1455,9 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         if (exp_type or None) != (got_type or None):
             add("高", CAT3, d.date, wd, "アイコン種別", got_type or "（なし）",
                 f"{exp_type or '（なし）'}" + (f"　※A列:{md.label}" if md.label else ""),
-                ("マスタの色: #" + md.label_color if md.label_color else "") + exp_note)
+                ((f"マスタのラベル列の色（#{md.label_color}）" + (f"では「{exp_type}」" if exp_type else "はアイコンの色ではないため「アイコンなし」"))
+                 if md.label_color else "マスタのラベル列に色がないため「アイコンなし」")
+                + f"のはずですが、PDFは「{got_type or 'アイコンなし'}」です" + exp_note)
             mark(CAT3, False)
         elif exp_type and exp_type in ("プレミアム", "フェア") and md.event_name:
             res, note = compare_text(d.icon_name, md.event_name)
@@ -1414,7 +1467,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                 if fx and fx.event and no_ws(fx.event) == no_ws(d.icon_name):
                     extra_note = "（FaxDM訴求文のイベント名とは一致）"
                 add("中" if res == "高" else res, CAT3, d.date, wd, "アイコン名", d.icon_name or "（なし）",
-                    md.event_name, (note or "アイコン横の名前がマスタと違います") + extra_note)
+                    md.event_name, "アイコン横の名前がマスタのラベル列と違います：" + (note or diff_note(d.icon_name, md.event_name)) + extra_note)
                 mark(CAT3, False)
 
         # ご飯
@@ -1423,24 +1476,25 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                 used_rice_words.add(md.rice_word)
                 if md.rice_word not in d.rice_marks:
                     add("高", CAT6, d.date, wd, "ご飯マーク", ", ".join(d.rice_marks) or "（なし）", md.rice_word,
-                        "マスタでは" + md.label + "の日です")
+                        f"マスタのラベル列が「{md.label}」なので「{md.rice_word}」マークが必要ですが、PDFのこの日の欄にありません")
                     mark(CAT6, False)
             for mk in d.rice_marks:
                 if mk != md.rice_word and not (md.rice_word and md.rice_word not in d.rice_marks):
                     add("中", CAT6, d.date, wd, "ご飯マーク", mk, md.rice_word or "（なし）",
-                        "マスタでは" + (md.label or "該当しない日") + "です")
+                        f"PDFに「{mk}」マークがありますが、マスタのラベル列は「{md.label or '空欄'}」です")
                     mark(CAT6, False)
                 used_rice_words.add(mk)
         elif d.rice_marks:
             add("情報", CAT6 if pdf.zeitaku else CAT2, d.date, wd, "ご飯マーク", ", ".join(d.rice_marks),
-                md.rice_word or md.memo or "", "贅沢なし版にご飯マークがあります（必要なら確認）")
+                md.rice_word or md.memo or "", "ご飯マークのチェックは贅沢あり版だけが対象ですが、贅沢なし版にマークがあるので参考表示しています")
 
     # ⑥ 注記
     if pdf.zeitaku:
         for w in sorted(used_rice_words):
             phrase = f"{w}の日は、ご飯の変更はできません。"
             if no_ws(phrase) not in no_ws(pdf.fulltext):
-                add("高", CAT6, None, "", "注記", "（なし）", phrase, "欄外の注記が見当たりません")
+                add("高", CAT6, None, "", "注記", "（なし）", phrase,
+                    f"「{w}」の日があるので欄外に注記が必要ですが、PDFに見当たりません")
                 mark(CAT6, False)
         if not used_rice_words:
             status[CAT6] = ("OK", "掲載期間に該当日なし")
@@ -1457,9 +1511,9 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             found = next((t for t, _ in pdf.phrases), "")
             if found:
                 where = "注文欄の上" if pdf.phrases[0][1] < pdf.grid_top else "注文欄の下"
-                add("高", CAT5, None, "", "定型文", found.split("\u3000")[0], exp, f"文言が違います（{where}にあるので「{'下記' if '下記' in exp else '上記'}」）")
+                add("高", CAT5, None, "", "定型文", found.split("\u3000")[0], exp, f"文言が違います：{where}にあるので「{'下記' if '下記' in exp else '上記'}メニューに加え」が正しい表記です（{diff_note(found.split(chr(0x3000))[0], exp)}）")
             else:
-                add("高", CAT5, None, "", "定型文", "（なし）", exp, "贅沢あり版に必要な文言が見当たりません")
+                add("高", CAT5, None, "", "定型文", "（なし）", exp, "贅沢あり版に必ず入れる文言ですが、PDFに見当たりません")
             mark(CAT5, False)
     # ⑧ 共通文言
     for ph in cfg.common_required:
@@ -1470,7 +1524,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         head = target[:3]
         m = re.search(re.escape(head) + ".{0," + str(len(target)) + "}", text)
         if m:
-            add("高", CAT8, None, "", "定型文言", m.group(0)[:len(target)], ph, "定型文言が違います（誤字の可能性）")
+            add("高", CAT8, None, "", "定型文言", m.group(0)[:len(target)], ph,
+                f"全店共通の定型文言「{ph}」と一致しません。誤字の可能性があります（{diff_note(m.group(0)[:len(target)], target)}）")
             mark(CAT8, False)
         # 文字として読み取れない（画像・アウトライン化）場合は何も出さない
 
@@ -1480,21 +1535,23 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         if pdf.period:
             _, ps, pe = pdf.period
             if first != ps:
-                add("中", CAT7, first, "", "掲載開始日", fmt_date(first), fmt_date(ps), "ファイル名の掲載期間と最初の日付が違います")
+                add("中", CAT7, first, "", "掲載開始日", fmt_date(first), fmt_date(ps),
+                    f"ファイル名の掲載期間は{fmt_date(ps)}〜{fmt_date(pe)}ですが、PDFの最初の日付は{fmt_date(first)}です")
                 mark(CAT7, False)
             if last != pe:
-                add("中", CAT7, last, "", "掲載終了日", fmt_date(last), fmt_date(pe), "ファイル名の掲載期間と最後の日付が違います")
+                add("中", CAT7, last, "", "掲載終了日", fmt_date(last), fmt_date(pe),
+                    f"ファイル名の掲載期間は{fmt_date(ps)}〜{fmt_date(pe)}ですが、PDFの最後の日付は{fmt_date(last)}です")
                 mark(CAT7, False)
         pdf_dates = {d.date for d in pdf.days}
         for dd, md in sorted(masters.items()):
             if first <= dd <= last and md.is_full and dd not in pdf_dates:
                 add("高", CAT7, dd, WEEKDAY_JA[dd.weekday()], "掲載漏れ", "（なし）", md.fields.get("main", ""),
-                    "マスタにある日がPDFにありません")
+                    f"月別マスタでは{fmt_date(dd)}に献立がありますが、PDFの掲載期間内にこの日がありません")
                 mark(CAT7, False)
         seq = [(d.col, d.yc, d.date) for d in sorted(pdf.days, key=lambda d: (d.col, d.yc))]
         for a, b in zip(seq, seq[1:]):
             if a[2] and b[2] and b[2] <= a[2]:
-                add("中", CAT7, b[2], "", "並び順", fmt_date(b[2]), "", f"{fmt_date(a[2])} の次に並んでいます")
+                add("中", CAT7, b[2], "", "並び順", fmt_date(b[2]), "", f"日付は上から順に並ぶはずですが、{fmt_date(b[2])}が{fmt_date(a[2])}の次に並んでいます")
                 mark(CAT7, False)
 
     # ④ イチオシ
@@ -1504,11 +1561,13 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         d = it.date
         wd = it.weekday_char
         if d is None:
-            add("高", CAT4, None, wd, "日付", f"{it.month}/{it.day}", "", "注文欄に同じ日付がなく、月を特定できません")
+            add("高", CAT4, None, wd, "日付", f"{it.month}/{it.day}", "",
+                "イチオシ欄の日付と同じ日が注文欄になく、月を特定できません（日付の誤りの可能性）")
             mark(CAT4, False)
             continue
         if WEEKDAY_CHARS.get(wd) != d.weekday():
-            add("高", CAT4, d, wd, "曜日", wd, WEEKDAY_JA[d.weekday()], "イチオシ欄の曜日が日付と合っていません")
+            add("高", CAT4, d, wd, "曜日", wd, WEEKDAY_JA[d.weekday()],
+                f"{fmt_date(d)}は{WEEKDAY_JA[d.weekday()]}曜日ですが、イチオシ欄の曜日が「{wd}」になっています")
             mark(CAT4, False)
         gd = next((x for x in pdf.days if x.date == d), None)
         md = masters.get(d)
@@ -1516,48 +1575,59 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             gmain = next((x[0] for x in gd.items if not x[2]), "")
             res, _ = compare_text(it.menu, gmain, True)
             if res == "高":
-                add("高", CAT4, d, wd, "メニュー（注文欄と比較）", it.menu, gmain, "イチオシ欄と注文欄のメインが違います")
+                add("高", CAT4, d, wd, "メニュー（注文欄と比較）", it.menu, gmain,
+                    "イチオシ欄のメニューが、注文欄の同じ日のメインと違います：" + diff_note(it.menu, gmain))
                 mark(CAT4, False)
         if md:
             res, _ = compare_text(it.menu, md.fields.get("main", ""), True)
             if res != "OK":
-                add(res, CAT4, d, wd, "メニュー（マスタと比較）", it.menu, md.fields.get("main", ""), "")
+                add(res, CAT4, d, wd, "メニュー（マスタと比較）", it.menu, md.fields.get("main", ""),
+                    "イチオシ欄のメニューが、月別マスタのmain列と違います：" + diff_note(it.menu, md.fields.get("main", "")))
                 mark(CAT4, False)
             exp_t = md.icon_type
             if it.type and exp_t and it.type != exp_t:
-                add("高", CAT4, d, wd, "種別", it.type, exp_t, "マスタの色と違います")
+                add("高", CAT4, d, wd, "種別", it.type, exp_t,
+                    f"イチオシ欄の種別は「{it.type}」ですが、マスタのラベル列の色では「{exp_t}」です")
                 mark(CAT4, False)
             if gd and it.type and gd.icon_type and it.type != gd.icon_type:
-                add("中", CAT4, d, wd, "種別（注文欄と比較）", it.type, gd.icon_type, "")
+                add("中", CAT4, d, wd, "種別（注文欄と比較）", it.type, gd.icon_type,
+                    f"イチオシ欄の種別は「{it.type}」ですが、注文欄の同じ日のアイコンは「{gd.icon_type}」です")
                 mark(CAT4, False)
         fx = [r for r in fax if r.month == d.month and r.day == d.day]
         if not fax:
             continue
         if not fx:
-            add("高", CAT4, d, wd, "訴求文", it.comment, "（FaxDM訴求文に行なし）", "")
+            add("高", CAT4, d, wd, "訴求文", it.comment, "（FaxDM訴求文に行なし）",
+                f"FaxDM訴求文に{fmt_date(d)}の行がないため、一言コメントを照合できません")
             mark(CAT4, False)
             continue
         r = next((r for r in fx if r.fixed), fx[0])
         if not r.fixed:
-            add("高", CAT4, d, wd, "一言コメント", it.comment, "（確定が空欄）", "FaxDM訴求文の「確定」が未入力です")
+            add("高", CAT4, d, wd, "一言コメント", it.comment, "（確定が空欄）",
+                f"FaxDM訴求文の{fmt_date(d)}の行の「確定」列が空欄のため、一言コメントを照合できません")
             mark(CAT4, False)
         else:
             res, note = compare_text(it.comment, r.fixed, True)
             if res != "OK":
-                add(res, CAT4, d, wd, "一言コメント", it.comment, r.fixed, note)
+                add(res, CAT4, d, wd, "一言コメント", it.comment, r.fixed,
+                    f"イチオシ欄の一言コメントが、FaxDM訴求文の「確定」列と違います：{note}" if res == "高" else note)
                 mark(CAT4, False)
         res, _ = compare_text(it.menu, r.menu, True)
         if res != "OK":
-            add("中" if res == "高" else res, CAT4, d, wd, "メニュー（FaxDM訴求文と比較）", it.menu, r.menu, "")
+            add("中" if res == "高" else res, CAT4, d, wd, "メニュー（FaxDM訴求文と比較）", it.menu, r.menu,
+                "イチオシ欄のメニューが、FaxDM訴求文の「メニュー名」列と違います：" + diff_note(it.menu, r.menu))
             mark(CAT4, False)
         if it.type and r.type and it.type != r.type:
-            add("中", CAT4, d, wd, "種別（FaxDM訴求文と比較）", it.type, r.type, "")
+            add("中", CAT4, d, wd, "種別（FaxDM訴求文と比較）", it.type, r.type,
+                f"イチオシ欄の種別は「{it.type}」ですが、FaxDM訴求文の「種別」列は「{r.type}」です")
             mark(CAT4, False)
         if it.event and r.event and compare_text(it.event, r.event, True)[0] != "OK":
-            add("中", CAT4, d, wd, "イベント名（FaxDM訴求文と比較）", it.event, r.event, "")
+            add("中", CAT4, d, wd, "イベント名（FaxDM訴求文と比較）", it.event, r.event,
+                "イチオシ欄のイベント名が、FaxDM訴求文の「イベント名」列と違います：" + diff_note(it.event, r.event))
             mark(CAT4, False)
         if r.adopt == "否":
-            add("中", CAT4, d, wd, "選定可否", "イチオシに掲載", "否", "FaxDM訴求文では「否」になっています")
+            add("中", CAT4, d, wd, "選定可否", "イチオシに掲載", "否",
+                f"イチオシ欄に載っていますが、FaxDM訴求文の{fmt_date(d)}の行は「選定可否」が「否」です")
             mark(CAT4, False)
     # ⑨ 個別原稿：店舗情報
     if pdf.individual:
