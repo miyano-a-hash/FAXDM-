@@ -821,10 +821,13 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     page = doc[0]
     title = (doc.metadata or {}).get("title") or ""
     spans = _spans(page)
-    # 同じ文字が同じ位置に黒と白で重ねてある場合（日付の数字など）は黒い方だけ使う
-    darks = [x for x in spans if not x.white]
-    spans = [x for x in spans if not (x.white and any(
-        d.text == x.text and abs(d.x0 - x.x0) < 1.5 and abs(d.y0 - x.y0) < 1.5 for d in darks))]
+    # 同じ文字が同じ位置に重ねてある場合（黒と白の重ね、同じ文字の二重描画など）は1つだけ使う（黒を優先）
+    keep = []
+    for x in sorted(spans, key=lambda s: s.white):
+        if not any(k.text == x.text and abs(k.x0 - x.x0) < 1.5 and abs(k.y0 - x.y0) < 1.5 for k in keep):
+            keep.append(x)
+    keep_ids = {id(x) for x in keep}
+    spans = [x for x in spans if id(x) in keep_ids]
     warnings = []
     if len(doc) > 1:
         warnings.append(f"{len(doc)}ページありますが、1ページ目だけをチェックしました")
@@ -835,7 +838,12 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     period = _period_from(name) or _period_from(title)
 
     # --- グリッド（注文欄）の位置 ---
-    headers = sorted([s for s in spans if re.match(r"^\s*\d{4}\s*年", s.text)], key=lambda s: s.x0)
+    headers = []
+    for h in sorted([s for s in spans if re.match(r"^\s*\d{4}\s*年", s.text)], key=lambda s: s.x0):
+        # 同じ列の見出しが重ねて入っている場合は1つにまとめる（列の数がずれるとイチオシ欄を見失う）
+        if headers and h.x0 - headers[-1].x0 < 40:
+            continue
+        headers.append(h)
     if not headers:
         simple = _read_pdf_simple(page, name, title, period, warnings, fulltext)
         if simple:
