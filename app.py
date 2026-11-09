@@ -1139,7 +1139,11 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
                 and abs(p.yc - s.yc) < s.size]
         month = int(pref[0].text.strip()) if pref else None
         reg = [x for x in reg if not (x.din and x.text.strip().isdigit())]
-        type_sp = [x for x in reg if x.text.strip() in TYPE_WORDS]
+        # 種別ラベル（日付の上の小さい「フェア」など）は曜日より左にあるものだけ。
+        # 右側の「スタミナ／フェア」の2行目のように、イベント名の一部が種別と同じ文字のことがある
+        type_sp = [x for x in reg if x.text.strip() in TYPE_WORDS and x.x0 < w.x1 - 2]
+        if not type_sp:
+            type_sp = [x for x in reg if x.text.strip() in TYPE_WORDS and x.y1 <= s.y0 + 2]
         itype = TYPE_ALIASES.get(type_sp[0].text.strip(), "") if type_sp else ""
         reg = [x for x in reg if x not in type_sp and not x.white and x.size < 20
                and not any(h in x.text for h in ("おすすめメニュー", "イチオシ", "今月の"))]
