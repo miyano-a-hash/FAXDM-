@@ -161,27 +161,10 @@ def diff_note(pdf: str, master: str, max_parts: int = 3) -> str:
     return "／".join(parts)
 
 
-# PDFの中で文字として読めない字（「�」で出てくる）。
-# 「噌」「挽」「溢」などの新しい字形（JIS2004字形）は、フォントによって文字の対応表がなく、
-# PyMuPDF で読み取ると「�」になる（例：味�煮、粗�き、旨み�れる）。
-UNREADABLE = "\ufffd"
-
-
-def unreadable_match(pdf: str, master: str) -> bool:
-    """PDFの「�」を「何か1文字」とみなして、残りの文字がマスタと全部同じなら True"""
-    p, m = no_ws(pdf), no_ws(master)
-    if UNREADABLE not in p:
-        return False
-    pat = "".join("." if ch == UNREADABLE else re.escape(ch) for ch in p)
-    return re.fullmatch(pat, m) is not None
-
-
 def compare_text(pdf: str, master: str, wrapped: bool = False):
     """戻り値: (判定, 説明)  判定は 'OK' / '低' / '高'"""
     p = fix_extract(pdf or "")
     m = (master or "").strip()
-    if unreadable_match(p, m):
-        return "OK", ""  # 読めない字以外はマスタと同じ（読めない字の数は画面上部のお知らせに出す）
     if p == m:
         return "OK", ""
     if no_ws(p) == no_ws(m):
@@ -748,6 +731,7 @@ class PdfDoc:
     order_headers: list = field(default_factory=list)  # 注文欄ごとの見出し（左から）
     price_labels: list = field(default_factory=list)   # 価格欄の弁当名（上から・左から）
     menu_only: bool = False                         # メニュー名だけ照合するレイアウト（2週間分ヨコ・オリジナル など）
+    header_note: tuple = ()                         # 注文欄の見出しの年月が掲載期間と合わないとき（PDFの表記, 正しい表記）
 
     @property
     def individual(self) -> bool:
@@ -768,9 +752,10 @@ def _spans(page) -> list:
 
 
 def _period_from(text: str):
-    """'261023配信261027-1106' → (配信日, 開始日, 終了日)"""
+    """'261023配信261027-1106' → (配信日, 開始日, 終了日)
+    個別原稿の「261204配信（個別）261207-11」のように、配信の後ろに（ ）などが入っていても読む"""
     t = unicodedata.normalize("NFKC", text)
-    m = re.search(r"(\d{2})(\d{2})(\d{2})\s*配信\s*(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})?(?!\d)", t)
+    m = re.search(r"(\d{2})(\d{2})(\d{2})\s*配信\D{0,12}?(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})?(?!\d)", t)
     if not m:
         return None
     g = m.groups()
@@ -850,10 +835,6 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         warnings.append(f"{len(doc)}ページありますが、1ページ目だけをチェックしました")
     if not any(re.search(r"[ぁ-んァ-ン一-龥]", s.text) for s in spans):
         raise ValueError("PDFから日本語の文字を読み取れませんでした（文字がアウトライン化されている可能性があります）")
-    n_unreadable = sum(s.text.count(UNREADABLE) for s in spans)
-    if n_unreadable:
-        warnings.append(f"文字として読めない字（「噌」「挽」「溢」などの新しい字形）が{n_unreadable}か所ありました。"
-                        "読めない字以外がマスタと同じ場合はOKとしています。念のため、その字だけ原稿を目で確認してください")
 
     fulltext = "".join(fix_extract(s.text) for s in sorted(spans, key=lambda s: (round(s.y0), s.x0)))
     period = _period_from(name) or _period_from(title)
@@ -927,6 +908,19 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     m_nums = re.findall(r"年\s*([\d\s/・]+)月", hdr0)
     if m_nums:
         months = [int(x) for x in re.findall(r"\d+", m_nums[0])]
+    # 見出しの年月がファイル名の掲載期間と合わない場合（例：12月分なのに「2026年11月」）
+    # → 見出しの誤りとして指摘し、日付は掲載期間の年月で割り当てる（でないと全日がずれて大量に誤指摘になる）
+    header_note = ()
+    if period and months:
+        ps_, pe_ = period[1], period[2]
+        exp_months = [ps_.month] + ([pe_.month] if pe_.month != ps_.month else [])
+        # 見出しの読み取りは「11 月/12 月」の後ろ側が取れないことがあるので、1つも重ならないときだけ誤りとする
+        if not (set(months) & set(exp_months)) or year not in (ps_.year, pe_.year):
+            exp_txt = f"{ps_.year}年" + "/".join(f"{x}月" for x in exp_months)
+            header_note = (re.sub(r"\s+", "", hdr0), exp_txt)
+            year, months = ps_.year, exp_months
+            warnings.append(f"注文欄の見出し（{header_note[0]}）がファイル名の掲載期間と合わないため、"
+                                f"日付は掲載期間（{exp_txt}）に合わせて照合しました")
     cur_m = months[0] if months else (period[1].month if period else 1)
     cur_y = year
     prev_day = None
@@ -1219,7 +1213,8 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     price_labels = _read_price_labels(spans, grid_top)
     qr_urls, qr_note = _read_qr(page)
     return PdfDoc(name, title, zeitaku_edition, period, days, ichioshi, fulltext, footnote_text, warnings,
-                  grid_top, phrases, store, prices, qr_urls, qr_note, order_headers, price_labels)
+                  grid_top, phrases, store, prices, qr_urls, qr_note, order_headers, price_labels,
+                  header_note=header_note)
 
 
 # ----------------------------------------------------------------------------
@@ -1937,6 +1932,11 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         # 文字として読み取れない（画像・アウトライン化）場合は何も出さない
 
     # ⑦ 期間・掲載漏れ
+    if pdf.header_note:
+        got_h, exp_h = pdf.header_note
+        add("高", CAT7, None, "", "注文欄の見出し（年月）", got_h, exp_h,
+            f"ファイル名の掲載期間からすると「{exp_h}」のはずですが、注文欄の見出しが「{got_h}」になっています")
+        mark(CAT7, False)
     if pdf.days:
         first, last = pdf.days[0].date, pdf.days[-1].date
         if pdf.period:
