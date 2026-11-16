@@ -1509,7 +1509,13 @@ def _read_prices(spans: list, grid_top: float) -> dict:
         lab = next((k for k in PRICE_COLUMNS if k in s.text or (k == "唐揚げ" and "から揚げ" in s.text)), None)
         if not lab:
             continue
-        nums = [x for x in spans if x.x0 > s.x1 - 2 and abs(x.yc - s.yc) < max(s.size, x.size) * 0.6
+        # 数字は「◯◯弁当」の右側にある。「●ヘルシー弁当　　　円（税込）」のように
+        # 空白と「円」まで1つの文字列で、数字だけが空白の上に重ねてある原稿もあるので、
+        # 文字列の右端ではなく「弁当」の終わりの位置から右を探す
+        txt = s.text
+        end = txt.find("弁当") + 2
+        left_edge = s.x0 + (s.x1 - s.x0) * end / max(len(txt), 1) - 2
+        nums = [x for x in spans if x.x0 > left_edge and abs(x.yc - s.yc) < max(s.size, x.size) * 0.6
                 and re.fullmatch(r"[\d,]+", unicodedata.normalize("NFKC", x.text.strip()))]
         if nums:
             v = min(nums, key=lambda x: x.x0)
