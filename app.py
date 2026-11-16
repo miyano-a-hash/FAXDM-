@@ -161,10 +161,27 @@ def diff_note(pdf: str, master: str, max_parts: int = 3) -> str:
     return "／".join(parts)
 
 
+# PDFの中で文字として読めない字（「�」で出てくる）。
+# 「噌」「挽」「溢」などの新しい字形（JIS2004字形）は、フォントによって文字の対応表がなく、
+# PyMuPDF で読み取ると「�」になる（例：味�煮、粗�き、旨み�れる）。
+UNREADABLE = "\ufffd"
+
+
+def unreadable_match(pdf: str, master: str) -> bool:
+    """PDFの「�」を「何か1文字」とみなして、残りの文字がマスタと全部同じなら True"""
+    p, m = no_ws(pdf), no_ws(master)
+    if UNREADABLE not in p:
+        return False
+    pat = "".join("." if ch == UNREADABLE else re.escape(ch) for ch in p)
+    return re.fullmatch(pat, m) is not None
+
+
 def compare_text(pdf: str, master: str, wrapped: bool = False):
     """戻り値: (判定, 説明)  判定は 'OK' / '低' / '高'"""
     p = fix_extract(pdf or "")
     m = (master or "").strip()
+    if unreadable_match(p, m):
+        return "OK", ""  # 読めない字以外はマスタと同じ（読めない字の数は画面上部のお知らせに出す）
     if p == m:
         return "OK", ""
     if no_ws(p) == no_ws(m):
@@ -833,6 +850,10 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
         warnings.append(f"{len(doc)}ページありますが、1ページ目だけをチェックしました")
     if not any(re.search(r"[ぁ-んァ-ン一-龥]", s.text) for s in spans):
         raise ValueError("PDFから日本語の文字を読み取れませんでした（文字がアウトライン化されている可能性があります）")
+    n_unreadable = sum(s.text.count(UNREADABLE) for s in spans)
+    if n_unreadable:
+        warnings.append(f"文字として読めない字（「噌」「挽」「溢」などの新しい字形）が{n_unreadable}か所ありました。"
+                        "読めない字以外がマスタと同じ場合はOKとしています。念のため、その字だけ原稿を目で確認してください")
 
     fulltext = "".join(fix_extract(s.text) for s in sorted(spans, key=lambda s: (round(s.y0), s.x0)))
     period = _period_from(name) or _period_from(title)
