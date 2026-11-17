@@ -1418,10 +1418,41 @@ def _simple_store(L: list, outside: list) -> dict:
 def _simple_prices(outside: list) -> dict:
     """価格欄（「ヘルシー弁当 450円」など）を読む。数字は同じ行・右側・すぐ下のどれかにある"""
     out = {}
+
+    def _nt(l):
+        return unicodedata.normalize("NFKC", l["t"]).lower()
+
+    def _yc(l):
+        return (l["y0"] + l["y1"]) / 2
+
+    def _is_kcal(nl):
+        """カロリー表記（「約 550 kcal」など）の数字か。kcal が数字の右か、すぐ下にある"""
+        if "kcal" in _nt(nl) or "カロリー" in _nt(nl):
+            return True
+        if "円" in _nt(nl):   # 「500円」は価格
+            return False
+        for o in outside:
+            if o is nl or not ("kcal" in _nt(o) or "カロリー" in _nt(o)):
+                continue
+            h = max(nl["y1"] - nl["y0"], 4)
+            if abs(_yc(o) - _yc(nl)) < h * 0.5 and -2 <= o["x0"] - nl["x1"] < h * 1.0:   # 右隣
+                return True
+            if -2 <= o["y0"] - nl["y1"] < h * 1.2 and o["x0"] < nl["x1"] + 5 and o["x1"] > nl["x0"] - 5:  # すぐ下
+                return True
+        return False
+
+    def _has_yen(nl):
+        """数字に「円」が付いているか（同じ文字列か、すぐ右の文字列）"""
+        if "円" in _nt(nl):
+            return True
+        h = max(nl["y1"] - nl["y0"], 4)
+        return any(o is not nl and _nt(o).strip().startswith("円") and abs(_yc(o) - _yc(nl)) < h * 0.8
+                   and -2 <= o["x0"] - nl["x1"] < h * 1.5 for o in outside)
+
     nums = []
     for l in outside:
         mm = re.match(r"^\s*([\d,]{3,5})\s*(円.*)?$", unicodedata.normalize("NFKC", l["t"]))
-        if mm:
+        if mm and not _is_kcal(l):   # カロリーの数字を価格と取り違えない
             nums.append((l, int(mm.group(1).replace(",", ""))))
     for l in sorted(outside, key=lambda l: (l["y0"], l["x0"])):
         t = unicodedata.normalize("NFKC", l["t"]).replace(" ", "").replace("\u3000", "").lstrip("●・")
@@ -1430,9 +1461,11 @@ def _simple_prices(outside: list) -> dict:
         lab = "南蛮" if "南蛮" in t else next((k for k in PRICE_COLUMNS if t.startswith(k)), None)
         if lab is None and t.startswith("から揚げ"):
             lab = "唐揚げ"
-        if not lab or lab in out or not t.startswith(lab if lab != "南蛮" else t[:1]):
+        if not lab or lab in out or not (lab == "南蛮" or t.startswith(lab) or (lab == "唐揚げ" and t.startswith("から揚げ"))):
             continue
-        mm = re.search(r"弁当[^\d]{0,3}([\d,]{3,5})円?", t)
+        # 同じ文字列の中に価格がある場合（「ヘルシー弁当500円」）。カロリー（550kcal）は除く
+        mm = (re.search(r"弁当.*?(?<![\d,])([\d,]{3,5})円", t)
+              or re.search(r"弁当[^\d]{0,3}([\d,]{3,5})(?![\d,]|kcal|Kcal|KCAL|キロ|カロリー)円?", t))
         if mm:
             out[lab] = int(mm.group(1).replace(",", ""))
             continue
@@ -1441,7 +1474,12 @@ def _simple_prices(outside: list) -> dict:
                  and abs((nl["y0"] + nl["y1"]) / 2 - yc) < 12]
         below = [(nl, v) for nl, v in nums if (nl["y0"] + nl["y1"]) / 2 > yc + 4 and nl["y0"] - l["y1"] < 30
                  and nl["x0"] < l["x1"] + 80 and nl["x1"] > l["x0"] - 10]
-        hit = min(right, key=lambda x: x[0]["x0"]) if right else (min(below, key=lambda x: x[0]["y0"]) if below else None)
+        # 「円」が付いている数字を優先（隣の弁当の数字などを拾わないため）。なければ従来どおり右 → 下
+        yen = [c for c in right + below if _has_yen(c[0])]
+        if yen:
+            hit = min(yen, key=lambda c: abs(_yc(c[0]) - yc) + abs(c[0]["x0"] - l["x0"]) * 0.3)
+        else:
+            hit = min(right, key=lambda x: x[0]["x0"]) if right else (min(below, key=lambda x: x[0]["y0"]) if below else None)
         if hit:
             out[lab] = hit[1]
     return out
@@ -1516,6 +1554,20 @@ def _read_store_block(spans: list, grid_bottom: float) -> dict:
     return out
 
 
+def _span_is_kcal(x, spans) -> bool:
+    """数字の右隣かすぐ下に「kcal」「カロリー」があれば、カロリー表記の数字とみなす"""
+    h = max(x.y1 - x.y0, 4)
+    for o in spans:
+        t = unicodedata.normalize("NFKC", o.text).lower()
+        if o is x or not ("kcal" in t or "カロリー" in t):
+            continue
+        if abs(o.yc - x.yc) < h * 0.5 and -2 <= o.x0 - x.x1 < h * 1.0:
+            return True
+        if -2 <= o.y0 - x.y1 < h * 1.2 and o.x0 < x.x1 + 5 and o.x1 > x.x0 - 5:
+            return True
+    return False
+
+
 def _read_prices(spans: list, grid_top: float) -> dict:
     """右上の価格欄（「ヘルシー弁当 500円」など）を読む"""
     out = {}
@@ -1532,7 +1584,8 @@ def _read_prices(spans: list, grid_top: float) -> dict:
         end = txt.find("弁当") + 2
         left_edge = s.x0 + (s.x1 - s.x0) * end / max(len(txt), 1) - 2
         nums = [x for x in spans if x.x0 > left_edge and abs(x.yc - s.yc) < max(s.size, x.size) * 0.6
-                and re.fullmatch(r"[\d,]+", unicodedata.normalize("NFKC", x.text.strip()))]
+                and re.fullmatch(r"[\d,]+", unicodedata.normalize("NFKC", x.text.strip()))
+                and not _span_is_kcal(x, spans)]   # カロリー（約550kcal）の数字は価格ではない
         if nums:
             v = min(nums, key=lambda x: x.x0)
             out[lab] = int(unicodedata.normalize("NFKC", v.text.strip()).replace(",", ""))
@@ -2389,4 +2442,4 @@ def main():
                 show_result(r)
 
 
-main()
+main()
