@@ -1276,6 +1276,61 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
     if kos:
         xmax = min(xmax, min(kos) - 3)
 
+    # メニュー欄の行を「1日分のまとまり」に分けて、まとまりごとに日付へ割り当てる。
+    # 日付の数字が段の中で少し上下にずれていると、1行目のメインが隣の日の範囲にはみ出すことがある
+    # （例：21日の「●チーズハンバーグ」が18日に入る）。そこで「●」で始まる行から新しい日が始まるとみなし、
+    # まとまりの大部分が入っている日付に、まとまりごと入れる。
+    def _band_of(l):
+        yc_ = (l["y0"] + l["y1"]) / 2
+        for k_ in range(len(anchors)):
+            if cs[k_] - h / 2 <= yc_ < cs[k_] + h / 2:
+                return k_
+        return None
+
+    ax1 = min(a["x1"] for a in anchors)
+    col = sorted([l for l in L if l not in anchors and l["size"] < 12 and l["x0"] >= ax1 - 2 and l["x0"] < xmax
+                  and cs[0] - h <= (l["y0"] + l["y1"]) / 2 < cs[-1] + h], key=lambda l: (round(l["y0"]), l["x0"]))
+    blocks = []
+    for l in col:
+        is_main = l["t"].strip().startswith("●")
+        if not blocks:
+            blocks.append([l])
+            continue
+        last = blocks[-1][-1]
+        gap = l["y0"] - last["y1"]
+        lh = max(l["y1"] - l["y0"], 4)
+        if is_main and (not last["t"].strip().startswith("●") or gap > lh * 0.45):
+            blocks.append([l])
+        else:
+            blocks[-1].append(l)
+    assign = {}   # id(行) → 日付の番号
+    for blk in blocks:
+        cnt = {}
+        for l in blk:
+            k_ = _band_of(l)
+            if k_ is not None:
+                cnt[k_] = cnt.get(k_, 0) + 1
+        # 隣り合う2つの日付にまたがっているときだけ、多い方にまとめる（それ以外は従来どおり行ごとに判定）
+        if len(cnt) == 2 and abs(max(cnt) - min(cnt)) == 1:
+            ks = sorted(cnt, key=lambda k_: -cnt[k_])
+            if cnt[ks[0]] > cnt[ks[1]]:
+                for l in blk:
+                    assign[id(l)] = ks[0]
+        elif len(cnt) == 1:
+            # 一番上・一番下の日付で、範囲から少しはみ出した行（例：8日の1行目のメイン）
+            for l in blk:
+                if _band_of(l) is None:
+                    assign[id(l)] = next(iter(cnt))
+        # どの日付の範囲にも入らない行は、メニュー欄の左端から書き始めていて、範囲からのはみ出しが
+        # わずかな行だけ入れる（欄外の縦書き「ご注文はこちらから」や「※…」の注意書きは入れない）
+        for l in blk:
+            if id(l) not in assign or _band_of(l) is not None:
+                continue
+            yc_ = (l["y0"] + l["y1"]) / 2
+            out_by = min(min(abs(yc_ - (c_ - h / 2)), abs(yc_ - (c_ + h / 2))) for c_ in cs)
+            if abs(l["x0"] - menu_x) > 3 or l["t"].strip().startswith(("※", "*", "＊")) or out_by > h * 0.25:
+                del assign[id(l)]
+
     days = []
     prev = None
     zeitaku_any = False
@@ -1294,8 +1349,11 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
         band = [l for l in L if l is not a and top <= (l["y0"] + l["y1"]) / 2 < bot]
         wd = mm.group(3) or next((l["t"].strip() for l in band if l["t"].strip() in WEEKDAY_CHARS
                                   and l["x0"] < menu_x and l["x0"] > a["x0"] - 5), "")
-        ls = sorted([l for l in band if l["size"] < 12 and l["x0"] >= a["x1"] - 2 and l["x0"] < xmax],
-                    key=lambda l: (round(l["y0"]), l["x0"]))
+        ls = [l for l in band if l["size"] < 12 and l["x0"] >= a["x1"] - 2 and l["x0"] < xmax
+              and assign.get(id(l), i) == i]
+        # 隣の日付の範囲にはみ出していたが、まとまりとしてはこの日付のもの
+        ls += [l for l in col if assign.get(id(l)) == i and l not in ls]
+        ls = sorted(ls, key=lambda l: (round(l["y0"]), l["x0"]))
         pd_ = PdfDay(day=day, month=cur_m, year=year, weekday_char=wd, yc=cs[i], top=top)
         mains, sides, zei = [], [], []
         mode = "side"
