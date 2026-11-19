@@ -106,6 +106,8 @@ HEADER_GLYPH_SIGNATURES = {
     (78, 24, 33, 24): "贅沢弁当",
 }
 MENU_FIELDS = ["main", "submain", "fukusai1", "fukusai2", "salad"]
+# 副菜をまとめて書く原稿（新店舗用のサンプルDMなど）の表記。これらは副菜・サラダの照合をしない
+SIDE_PLACEHOLDERS = {"その他副菜", "その他の副菜", "ほか副菜", "他副菜"}
 ZEITAKU_FIELDS = ["zeitaku1", "zeitaku2"]
 FIELD_JA = {"main": "メイン", "submain": "サブメイン", "fukusai1": "副菜1", "fukusai2": "副菜2",
             "salad": "サラダ(デザート)", "zeitaku1": "贅沢弁当1", "zeitaku2": "贅沢弁当2"}
@@ -754,7 +756,7 @@ def _spans(page) -> list:
 def _period_from(text: str):
     """'261023配信261027-1106' → (配信日, 開始日, 終了日)
     個別原稿の「261204配信（個別）261207-11」のように、配信の後ろに（ ）などが入っていても読む"""
-    t = unicodedata.normalize("NFKC", text)
+    t = unicodedata.normalize("NFKC", re.sub(r"[\u2460-\u2473\u24EA\u2776-\u277F]", " ", text or ""))
     m = re.search(r"(\d{2})(\d{2})(\d{2})\s*配信\D{0,12}?(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})?(?!\d)", t)
     if not m:
         return None
@@ -1255,11 +1257,23 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
         if mm:
             year, cur_m = int(mm.group(1)), int(mm.group(2))
             break
+    if period is None:  # 「261209-15」「261027-1109」のように配信日がないファイル名
+        period = _period_no_send(name) or _period_no_send(title)
     if year is None and period:
         year, cur_m = period[1].year, period[1].month
     if year is None:
+        # ファイル名からも分からないときは、原稿の「12月 9日」のような表記から月を取る
         today = dt.date.today()
-        year, cur_m = today.year, today.month
+        mm = re.search(r"(\d{1,2})月\s*(\d{1,2})日", unicodedata.normalize("NFKC", " ".join(l["t"] for l in L)))
+        if mm and 1 <= int(mm.group(1)) <= 12:
+            cur_m = int(mm.group(1))
+            year = today.year + (1 if cur_m < today.month - 6 else 0) - (1 if cur_m > today.month + 6 else 0)
+            warnings.append(f"ファイル名と注文欄の見出しから年月が分からないため、原稿の「{mm.group(0)}」から"
+                            f"{year}年{cur_m}月として照合しました")
+        else:
+            year, cur_m = today.year, today.month
+            warnings.append(f"年月が分からないため、今日の年月（{year}年{cur_m}月）として照合しました。"
+                            "ファイル名に掲載期間（例：261209-15）を入れてください")
 
     page_w = page.rect.width
     kos = [l["x0"] for l in L if l["t"].strip() == "個"]
@@ -1407,14 +1421,28 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
 
 
 def _period_no_send(text: str):
-    t = unicodedata.normalize("NFKC", text or "")
+    # 「FAXDM①261209-15」の「①」は正規化で「1」になり期間とくっつくので、先に外す
+    t = unicodedata.normalize("NFKC", re.sub(r"[\u2460-\u2473\u24EA\u2776-\u277F]", " ", text or ""))
     m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})(?!\d)", t)
+    if m:
+        y, m1, d1, m2, d2 = map(int, m.groups())
+        try:
+            start = dt.date(2000 + y, m1, d1)
+            return None, start, dt.date(start.year + (1 if m2 < m1 else 0), m2, d2)
+        except ValueError:
+            return None
+    # 「261209-15」のように、終わりが日だけの書き方（同じ月。日が戻っていれば翌月）
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})\s*-\s*(\d{1,2})(?!\d)", t)
     if not m:
         return None
-    y, m1, d1, m2, d2 = map(int, m.groups())
+    y, m1, d1, d2 = map(int, m.groups())
     try:
         start = dt.date(2000 + y, m1, d1)
-        return None, start, dt.date(start.year + (1 if m2 < m1 else 0), m2, d2)
+        if d2 >= d1:
+            end = dt.date(start.year, m1, d2)
+        else:
+            end = dt.date(start.year + (1 if m1 == 12 else 0), 1 if m1 == 12 else m1 + 1, d2)
+        return None, start, end
     except ValueError:
         return None
 
@@ -1885,7 +1913,11 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             add("中", CAT2, d.date, wd, "メニュー行", it[0], "",
                 "この日の欄に「●」の行が3つ以上あり、メイン・サブメインのどちらにも当てはまらない行があります")
             mark(CAT2, False)
-        if not pdf.zeitaku:
+        side_word = re.sub(r"[\s・●/／]", "", unicodedata.normalize("NFKC", "".join(d.side_lines)))
+        if not pdf.zeitaku and side_word in SIDE_PLACEHOLDERS:
+            # 新店舗用のサンプルDMなど、副菜を「・その他副菜」とまとめて書く原稿：副菜・サラダは照合しない
+            fields = ["main", "submain"]
+        elif not pdf.zeitaku:
             mvals = [md.fields.get(f, "") for f in ["fukusai1", "fukusai2", "salad"]]
             sides, by_break = split_sides(d.side_lines, mvals) if d.side_lines else ([], False)
             for f, v in zip(["fukusai1", "fukusai2", "salad"], sides):
