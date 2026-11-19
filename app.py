@@ -1995,9 +1995,9 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
     if sample:
         status[CAT3] = ("OK", "サンプルDMのため対象外")
         if not sample_menu:
-            status[CAT2] = ("要確認", "サンプルDMです。サンプルメニューPDFが入っていないため、メニューは照合していません")
+            status[CAT2] = ("要確認", "サンプルDMです。左の「サンプルメニュー（マスタ）」にPDFが入っていないため、メニューは照合していません")
         else:
-            status[CAT2] = ("OK", f"サンプルメニューPDF（{sample_menu['name']}）と照合")
+            status[CAT2] = ("OK", f"サンプルメニュー（マスタ）：{sample_menu['name']} と照合")
     used_rice_words = set()
     for d in pdf.days:
         md: Optional[MasterDay] = masters.get(d.date)
@@ -2009,8 +2009,8 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             exp_menu = sample_menu["menu"].get(d.date)
             items = [it[0] for it in d.items]
             if exp_menu is None:
-                add("高", CAT2, d.date, wd, "メニュー", " / ".join(items), "（サンプルメニューにこの日なし）",
-                    f"サンプルメニューPDF（{sample_menu['name']}）に{fmt_date(d.date)}の献立がありません")
+                add("高", CAT2, d.date, wd, "メニュー", " / ".join(items), "（サンプルメニュー（マスタ）にこの日なし）",
+                    f"サンプルメニュー（マスタ）「{sample_menu['name']}」に{fmt_date(d.date)}の献立がありません")
                 mark(CAT2, False)
                 continue
             # メニューが別の日のものと入れ替わっていないか（見つかれば備考に書く）
@@ -2019,14 +2019,14 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                 pv = items[k] if k < len(items) else ""
                 if not pv:
                     add("高", CAT2, d.date, wd, f_ja, "（記載なし）", ev,
-                        f"サンプルメニューPDFの{fmt_date(d.date)}の{f_ja}「{ev}」が、PDFのこの日の欄に見当たりません")
+                        f"サンプルメニュー（マスタ）の{fmt_date(d.date)}の{f_ja}「{ev}」が、DMのこの日の欄に見当たりません")
                     mark(CAT2, False)
                 elif _sample_key(pv) != _sample_key(ev):
                     other = swapped.get(_sample_key(items[0]) + "|" + _sample_key(items[1])) if len(items) >= 2 else None
-                    hint = (f"（この日のメニューは、サンプルメニューPDFでは{fmt_date(other)}の献立です）"
+                    hint = (f"（DMのこの日のメニューは、サンプルメニュー（マスタ）では{fmt_date(other)}の献立です）"
                             if other and other != d.date else "")
                     add("高", CAT2, d.date, wd, f_ja, fix_extract(pv), ev,
-                        f"サンプルメニューPDFの{fmt_date(d.date)}の{f_ja}と一致しません{hint}")
+                        f"サンプルメニュー（マスタ）の{fmt_date(d.date)}の{f_ja}と一致しません{hint}")
                     mark(CAT2, False)
             for extra_item in items[2:]:
                 add("中", CAT2, d.date, wd, "メニュー行", extra_item, "",
@@ -2237,7 +2237,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             if pdf_dates != exp_dates:
                 add("高", CAT7, first, "", "掲載期間",
                     "、".join(fmt_date(x) for x in sorted(pdf_dates)), "、".join(fmt_date(x) for x in sorted(exp_dates)),
-                    "サンプルDMの日付は、サンプルメニューPDFの最初の5日分になるはずですが、日付が合いません")
+                    "サンプルDMの日付は、サンプルメニュー（マスタ）の最初の5日分になるはずですが、日付が合いません")
                 mark(CAT7, False)
         for dd, md in sorted(masters.items()):
             if sample:   # サンプルDMは月別マスタと照合しない
@@ -2527,9 +2527,9 @@ def run_one(name: str, data: bytes, src: MasterSource, cfg: Config, sample_files
                 src.notes.append(f"サンプルメニューPDF「{sf_name}」からカレンダー（日付ごとのメニュー）を読み取れませんでした")
         sample_menu = pick_sample_menu(pdf, menus)
         if not sample_files:
-            src.notes.append("サンプルDMです。「サンプルメニューPDF」に店舗のサンプルメニュー（YDOPパンフなど）を入れると、メニューも照合します")
+            src.notes.append("サンプルDMです。左の「サンプルメニュー（マスタ）」に店舗のサンプルメニュー（YDOPパンフ）を入れると、メニューも照合します")
         elif menus and not sample_menu:
-            src.notes.append("サンプルメニューPDFが複数あり、この原稿の店舗に合うものを選べませんでした（ファイル名に店舗名を入れてください）")
+            src.notes.append("サンプルメニュー（マスタ）が複数あり、この原稿の店舗に合うものを選べませんでした（ファイル名に店舗名を入れてください）")
     masters = {}
     for y, m in sorted({(d.year, d.month) for d in pdf.days if d.year}):
         masters.update(src.monthly(y, m))
@@ -2537,7 +2537,7 @@ def run_one(name: str, data: bytes, src: MasterSource, cfg: Config, sample_files
     stores = src.stores() if pdf.individual else None
     findings, status = run_checks(pdf, masters, fax, cfg, stores, sample_menu)
     if sample_menu:
-        src.notes.append(f"サンプルDMのため、メニューは月別マスタではなくサンプルメニューPDF「{sample_menu['name']}」"
+        src.notes.append(f"サンプルDMのため、メニューは月別マスタではなくサンプルメニュー（マスタ）「{sample_menu['name']}」"
                          f"（{sample_menu['page']}ページ目）と照合しました")
     notes = list(dict.fromkeys(src.notes))
     excel = write_report(pdf, findings, status, masters, notes)
@@ -2672,6 +2672,14 @@ def main():
             if st.button("🔄 マスタを今すぐ取り直す"):
                 st.cache_data.clear()
                 st.toast("次の校正で最新のマスタを取得します")
+        st.divider()
+        st.subheader("サンプルメニュー（マスタ）")
+        st.caption("新店舗用のサンプルDMを校正するときだけ使います。サンプルDMのメニューは月別マスタではなく、"
+                   "ここに入れた店舗のサンプルメニュー（YDOPパンフ）を**正**として照合します。")
+        sample_pdfs = st.file_uploader(
+            "サンプルメニューのPDF", type=["pdf"], accept_multiple_files=True,
+            help="例：YDOPパンフ_インパムキッチン_1209.pdf。ファイル名に「新店舗用」「サンプル」が入ったDMが対象です。"
+                 "複数の店舗をまとめて校正するときは、ファイル名に店舗名を入れてください（DMと自動で組み合わせます）")
         with st.expander("判定ルール"):
             st.markdown("**アイコンの色（ラベル列）**")
             for k, v in ICON_COLORS.items():
@@ -2681,10 +2689,6 @@ def main():
             st.markdown("**重要度**：高＝誤りの可能性大／中＝要確認／低＝スペースや記号の細部／情報＝参考")
 
     pdfs = st.file_uploader("PDF原稿（複数可）", type=["pdf"], accept_multiple_files=True)
-    sample_pdfs = st.file_uploader(
-        "サンプルメニューPDF（新店舗用のサンプルDMを校正するときだけ）", type=["pdf"], accept_multiple_files=True,
-        help="店舗ごとのサンプルメニュー（YDOPパンフなど）。ファイル名に「新店舗用」「サンプル」が入ったDMは、"
-             "月別マスタではなくこのPDFのカレンダーと日付ごとに照合します。複数の店舗を入れるときは、ファイル名に店舗名を入れてください")
     if st.button("校正する", type="primary", disabled=not pdfs):
         src = MasterSource(provider, cfg)
         results = []
