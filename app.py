@@ -108,6 +108,29 @@ HEADER_GLYPH_SIGNATURES = {
 MENU_FIELDS = ["main", "submain", "fukusai1", "fukusai2", "salad"]
 # 副菜をまとめて書く原稿（新店舗用のサンプルDMなど）の表記。これらは副菜・サラダの照合をしない
 SIDE_PLACEHOLDERS = {"その他副菜", "その他の副菜", "ほか副菜", "他副菜"}
+
+# 新店舗用のサンプルDM：ファイル名にこの言葉があればサンプルDMとして扱う
+SAMPLE_WORDS = ["新店舗用", "サンプル"]
+# サンプルDMのメニュー（水曜〜翌週火曜で固定。月別マスタとは別物）。曜日 → (メイン, サブメイン)
+# メニューが変わったらここを書き換えてください
+SAMPLE_MENU = {
+    "水": ("とろーりエッグハンバーグ BBQソース", "エビフライ　ごろっとポテトの黒胡麻マヨ"),
+    "木": ("チキン竜田　明太マヨソース", "デミグラスで煮込んだとろとろ牛すじ入りシチュー"),
+    "金": ("チーズインハンバーグ　ポークシチュー", "牛ハラミカツ　スタミナ焼肉たれ"),
+    "月": ("宮崎郷土料理チキン南蛮風 タルタル添え", "四川風挽肉たっぷり”しびれ”麻婆春雨"),
+    "火": ("ビーフ入りメンチカツ　カラフルカレーソース", "合鴨とショートパスタのペペロンチーノ"),
+}
+
+
+def is_sample_dm(pdf) -> bool:
+    return any(w in (pdf.path or "") or w in (pdf.title or "") for w in SAMPLE_WORDS)
+
+
+def _sample_key(s: str) -> str:
+    """サンプルメニューの照合用：空白と引用符の違いは無視する"""
+    t = unicodedata.normalize("NFKC", s or "").lstrip("●・ ")
+    t = re.sub(r"[“”\"″〝〟]", "\"", t)
+    return no_ws(t)
 ZEITAKU_FIELDS = ["zeitaku1", "zeitaku2"]
 FIELD_JA = {"main": "メイン", "submain": "サブメイン", "fukusai1": "副菜1", "fukusai2": "副菜2",
             "salad": "サラダ(デザート)", "zeitaku1": "贅沢弁当1", "zeitaku2": "贅沢弁当2"}
@@ -1891,10 +1914,40 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             mark(CAT1, False)
 
     # ② メニュー名 ③ アイコン ⑥ ご飯
+    sample = is_sample_dm(pdf)
+    if sample:
+        status[CAT3] = ("OK", "サンプルDMのため対象外")
     used_rice_words = set()
     for d in pdf.days:
         md: Optional[MasterDay] = masters.get(d.date)
         wd = d.weekday_char
+        if sample:
+            # 新店舗用のサンプルDM：メニューは月別マスタではなく、固定のサンプルメニューと照合する
+            if d.date is None:
+                continue
+            wj = WEEKDAY_JA[d.date.weekday()]
+            exp_menu = SAMPLE_MENU.get(wj)
+            items = [it[0] for it in d.items]
+            if exp_menu is None:
+                add("中", CAT2, d.date, wd, "メニュー", " / ".join(items), "（サンプルメニューなし）",
+                    f"サンプルDMのメニューは水・木・金・月・火の5日分ですが、{wj}曜日の日が載っています")
+                mark(CAT2, False)
+                continue
+            for k, (f_ja, ev) in enumerate(zip(["メイン", "サブメイン"], exp_menu)):
+                pv = items[k] if k < len(items) else ""
+                if not pv:
+                    add("高", CAT2, d.date, wd, f_ja, "（記載なし）", ev,
+                        f"サンプルメニュー（{wj}曜日）の{f_ja}「{ev}」が、PDFのこの日の欄に見当たりません")
+                    mark(CAT2, False)
+                elif _sample_key(pv) != _sample_key(ev):
+                    add("高", CAT2, d.date, wd, f_ja, fix_extract(pv), ev,
+                        f"サンプルメニュー（{wj}曜日）の{f_ja}と一致しません")
+                    mark(CAT2, False)
+            for extra_item in items[2:]:
+                add("中", CAT2, d.date, wd, "メニュー行", extra_item, "",
+                    "この日の欄に「●」の行が3つ以上あり、メイン・サブメインのどちらにも当てはまらない行があります")
+                mark(CAT2, False)
+            continue
         if md is None:
             add("高", CAT7, d.date, wd, "日付", f"{fmt_date(d.date)}", "",
                 f"PDFに{fmt_date(d.date)}がありますが、月別マスタ（day列）にこの日付がありません")
@@ -2093,7 +2146,23 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                     f"ファイル名の掲載期間は{fmt_date(ps)}〜{fmt_date(pe)}ですが、PDFの最後の日付は{fmt_date(last)}です")
                 mark(CAT7, False)
         pdf_dates = {d.date for d in pdf.days}
+        if sample and first and last:
+            # サンプルDMは「水曜〜翌週火曜」の平日5日分
+            exp_dates = {first + dt.timedelta(days=k) for k in (0, 1, 2, 5, 6)}
+            if first.weekday() != 2 or (last - first).days != 6:
+                add("中", CAT7, first, "", "掲載期間", f"{fmt_date(first)}〜{fmt_date(last)}", "水曜〜翌週火曜",
+                    f"サンプルDMは水曜〜翌週火曜の期間ですが、PDFは{fmt_date(first)}（{WEEKDAY_JA[first.weekday()]}）〜"
+                    f"{fmt_date(last)}（{WEEKDAY_JA[last.weekday()]}）になっています")
+                mark(CAT7, False)
+            elif pdf_dates != exp_dates:
+                miss = sorted(exp_dates - pdf_dates)
+                add("高", CAT7, miss[0] if miss else first, "", "掲載漏れ",
+                    "、".join(fmt_date(x) for x in sorted(pdf_dates)), "、".join(fmt_date(x) for x in sorted(exp_dates)),
+                    "サンプルDMは水・木・金・月・火の5日分を載せる決まりですが、日付が足りないか余分な日があります")
+                mark(CAT7, False)
         for dd, md in sorted(masters.items()):
+            if sample:   # サンプルDMは月別マスタと照合しない
+                break
             if first <= dd <= last and md.is_full and dd not in pdf_dates:
                 add("高", CAT7, dd, WEEKDAY_JA[dd.weekday()], "掲載漏れ", "（なし）", md.fields.get("main", ""),
                     f"月別マスタでは{fmt_date(dd)}に献立がありますが、PDFの掲載期間内にこの日がありません")
