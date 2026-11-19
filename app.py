@@ -111,17 +111,6 @@ SIDE_PLACEHOLDERS = {"その他副菜", "その他の副菜", "ほか副菜", "�
 
 # 新店舗用のサンプルDM：ファイル名にこの言葉があればサンプルDMとして扱う
 SAMPLE_WORDS = ["新店舗用", "サンプル"]
-# サンプルDMのメニュー（水曜〜翌週火曜で固定。月別マスタとは別物）。曜日 → (メイン, サブメイン)
-# メニューが変わったらここを書き換えてください
-SAMPLE_MENU = {
-    "水": ("とろーりエッグハンバーグ BBQソース", "エビフライ　ごろっとポテトの黒胡麻マヨ"),
-    "木": ("チキン竜田　明太マヨソース", "デミグラスで煮込んだとろとろ牛すじ入りシチュー"),
-    "金": ("チーズインハンバーグ　ポークシチュー", "牛ハラミカツ　スタミナ焼肉たれ"),
-    "月": ("宮崎郷土料理チキン南蛮風 タルタル添え", "四川風挽肉たっぷり”しびれ”麻婆春雨"),
-    "火": ("ビーフ入りメンチカツ　カラフルカレーソース", "合鴨とショートパスタのペペロンチーノ"),
-}
-
-
 def is_sample_dm(pdf) -> bool:
     return any(w in (pdf.path or "") or w in (pdf.title or "") for w in SAMPLE_WORDS)
 
@@ -131,6 +120,90 @@ def _sample_key(s: str) -> str:
     t = unicodedata.normalize("NFKC", s or "").lstrip("●・ ")
     t = re.sub(r"[“”\"″〝〟]", "\"", t)
     return no_ws(t)
+
+
+def read_sample_menu(data: bytes, name: str = "", year_hint: Optional[int] = None) -> dict:
+    """店舗ごとのサンプルメニューPDF（YDOPパンフなど）のカレンダーから、日付ごとのメイン・サブメインを読む。
+    戻り値：{"menu": {date: (メイン, サブメイン)}, "dates": [date…], "page": ページ番号}
+    カレンダーは「12.9〜12.25」のような見出しのあるページ。各日の欄は
+    メイン／サブメイン／副菜／副菜／サラダ の順に並び、その下に「贅沢」欄と栄養成分表がある前提。"""
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    best = {"menu": {}, "dates": [], "page": None}
+    for pno in range(len(doc)):
+        L = _page_lines(doc[pno])
+        text = unicodedata.normalize("NFKC", " ".join(l["t"] for l in L))
+        # カレンダーの見出し「12.9〜12.25」（「12.9」と「〜12.25」が別の文字列のこともある）の最初の月
+        heads = sorted([l for l in L if l["size"] >= 18
+                        and re.search(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?!\d)", unicodedata.normalize("NFKC", l["t"]))],
+                       key=lambda l: (l["y0"], l["x0"]))
+        if not heads:
+            continue
+        mh = re.search(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?!\d)", unicodedata.normalize("NFKC", heads[0]["t"]))
+        start_m = int(mh.group(1))
+        if not 1 <= start_m <= 12:
+            continue
+        my = re.search(r"(20\d{2})", text)
+        year = int(my.group(1)) if my else (year_hint or dt.date.today().year)
+
+        def clean(t):
+            return re.sub(r"^\s*[左右]?#\s*", "", unicodedata.normalize("NFKC", t)).strip()
+
+        menu_ls = [l for l in L if 7.3 <= l["size"] <= 9.6 and clean(l["t"]) and "#" not in clean(l["t"])]
+        stops = [l for l in L if clean(l["t"]) == "贅沢" or (l["size"] <= 6.5 and "エネルギー" in l["t"])]
+        nums = [l for l in L if 9.5 <= l["size"] <= 18 and re.fullmatch(r"\d{1,2}", l["t"].strip())]
+        # 同じ日付が重ねて入っている場合は1つにまとめる
+        cells = []
+        for n in sorted(nums, key=lambda l: (l["y0"], l["x0"])):
+            if any(c["t"].strip() == n["t"].strip() and abs(c["x0"] - n["x0"]) < 8 and abs(c["y0"] - n["y0"]) < 12
+                   for c in cells):
+                continue
+            cells.append(n)
+        found = []
+        for c in cells:
+            x_lo, x_hi = c["x0"] - 6, c["x0"] + 165
+            below_stop = [st_["y0"] for st_ in stops if x_lo <= st_["x0"] <= x_hi and st_["y0"] > c["y1"]]
+            stop_y = min(below_stop) if below_stop else c["y1"] + 150
+            if stop_y - c["y1"] > 200:
+                continue
+            ls = sorted([l for l in menu_ls if x_lo <= l["x0"] <= x_hi and c["y1"] - 2 <= l["y0"] < stop_y],
+                        key=lambda l: l["y0"])
+            ls = ls[-5:]   # 「クリスマスメニュー」のような見出しを除くため、贅沢欄の直前の5行（メイン〜サラダ）を使う
+            if len(ls) < 2:
+                continue
+            found.append((c, clean(ls[0]["t"]), clean(ls[1]["t"])))
+        if not found:
+            continue
+        # 行（週）ごと、左から順に並べて月を決める（日が戻ったら翌月）
+        found.sort(key=lambda f: (round(f[0]["y0"] / 25), f[0]["x0"]))
+        menu, prev, m, y = {}, None, start_m, year
+        for c, main_, sub_ in found:
+            d = int(c["t"].strip())
+            if prev is not None and d < prev:
+                m += 1
+                if m > 12:
+                    m, y = 1, y + 1
+            prev = d
+            try:
+                menu[dt.date(y, m, d)] = (main_, sub_)
+            except ValueError:
+                pass
+        if len(menu) > len(best["menu"]):
+            best = {"menu": menu, "dates": sorted(menu), "page": pno + 1}
+    return best
+
+
+def pick_sample_menu(pdf, menus: list):
+    """サンプルメニューPDFが複数あるとき、DMのファイル名と店舗名が合うものを選ぶ。1つだけならそれを使う"""
+    if not menus:
+        return None
+    if len(menus) == 1:
+        return menus[0]
+    key = unicodedata.normalize("NFKC", (pdf.path or "") + " " + (pdf.title or ""))
+    for mn in menus:
+        toks = re.split(r"[_\s　\-（）()]+", unicodedata.normalize("NFKC", mn["name"].rsplit(".", 1)[0]))
+        if any(len(t) >= 3 and not re.fullmatch(r"[\dA-Za-z]+(パンフ)?", t) and t in key for t in toks):
+            return mn
+    return None
 ZEITAKU_FIELDS = ["zeitaku1", "zeitaku2"]
 FIELD_JA = {"main": "メイン", "submain": "サブメイン", "fukusai1": "副菜1", "fukusai2": "副菜2",
             "salad": "サラダ(デザート)", "zeitaku1": "贅沢弁当1", "zeitaku2": "贅沢弁当2"}
@@ -1455,10 +1528,13 @@ def _period_no_send(text: str):
         except ValueError:
             return None
     # 「261209-15」のように、終わりが日だけの書き方（同じ月。日が戻っていれば翌月）
-    m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})\s*-\s*(\d{1,2})(?!\d)", t)
+    # 「261208-21.25」のように後ろに追加の日（.25）があれば、最後の日を終わりとする
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})\s*-\s*(\d{1,2})((?:[.・,、]\d{1,2})*)(?!\d)", t)
     if not m:
         return None
-    y, m1, d1, d2 = map(int, m.groups())
+    y, m1, d1, d2 = map(int, m.groups()[:4])
+    if m.group(5):
+        d2 = int(re.findall(r"\d{1,2}", m.group(5))[-1])
     try:
         start = dt.date(2000 + y, m1, d1)
         if d2 >= d1:
@@ -1878,7 +1954,8 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
         mark(cat, False)
 
 
-def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optional[list] = None):
+def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optional[list] = None,
+               sample_menu: Optional[dict] = None):
     F = []
     status = {}
 
@@ -1917,31 +1994,39 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
     sample = is_sample_dm(pdf)
     if sample:
         status[CAT3] = ("OK", "サンプルDMのため対象外")
+        if not sample_menu:
+            status[CAT2] = ("要確認", "サンプルDMです。サンプルメニューPDFが入っていないため、メニューは照合していません")
+        else:
+            status[CAT2] = ("OK", f"サンプルメニューPDF（{sample_menu['name']}）と照合")
     used_rice_words = set()
     for d in pdf.days:
         md: Optional[MasterDay] = masters.get(d.date)
         wd = d.weekday_char
         if sample:
-            # 新店舗用のサンプルDM：メニューは月別マスタではなく、固定のサンプルメニューと照合する
-            if d.date is None:
+            # 新店舗用のサンプルDM：メニューは月別マスタではなく、店舗ごとのサンプルメニューPDFと照合する
+            if d.date is None or not sample_menu:
                 continue
-            wj = WEEKDAY_JA[d.date.weekday()]
-            exp_menu = SAMPLE_MENU.get(wj)
+            exp_menu = sample_menu["menu"].get(d.date)
             items = [it[0] for it in d.items]
             if exp_menu is None:
-                add("中", CAT2, d.date, wd, "メニュー", " / ".join(items), "（サンプルメニューなし）",
-                    f"サンプルDMのメニューは水・木・金・月・火の5日分ですが、{wj}曜日の日が載っています")
+                add("高", CAT2, d.date, wd, "メニュー", " / ".join(items), "（サンプルメニューにこの日なし）",
+                    f"サンプルメニューPDF（{sample_menu['name']}）に{fmt_date(d.date)}の献立がありません")
                 mark(CAT2, False)
                 continue
+            # メニューが別の日のものと入れ替わっていないか（見つかれば備考に書く）
+            swapped = {_sample_key(v[0]) + "|" + _sample_key(v[1]): k for k, v in sample_menu["menu"].items()}
             for k, (f_ja, ev) in enumerate(zip(["メイン", "サブメイン"], exp_menu)):
                 pv = items[k] if k < len(items) else ""
                 if not pv:
                     add("高", CAT2, d.date, wd, f_ja, "（記載なし）", ev,
-                        f"サンプルメニュー（{wj}曜日）の{f_ja}「{ev}」が、PDFのこの日の欄に見当たりません")
+                        f"サンプルメニューPDFの{fmt_date(d.date)}の{f_ja}「{ev}」が、PDFのこの日の欄に見当たりません")
                     mark(CAT2, False)
                 elif _sample_key(pv) != _sample_key(ev):
+                    other = swapped.get(_sample_key(items[0]) + "|" + _sample_key(items[1])) if len(items) >= 2 else None
+                    hint = (f"（この日のメニューは、サンプルメニューPDFでは{fmt_date(other)}の献立です）"
+                            if other and other != d.date else "")
                     add("高", CAT2, d.date, wd, f_ja, fix_extract(pv), ev,
-                        f"サンプルメニュー（{wj}曜日）の{f_ja}と一致しません")
+                        f"サンプルメニューPDFの{fmt_date(d.date)}の{f_ja}と一致しません{hint}")
                     mark(CAT2, False)
             for extra_item in items[2:]:
                 add("中", CAT2, d.date, wd, "メニュー行", extra_item, "",
@@ -2146,19 +2231,13 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
                     f"ファイル名の掲載期間は{fmt_date(ps)}〜{fmt_date(pe)}ですが、PDFの最後の日付は{fmt_date(last)}です")
                 mark(CAT7, False)
         pdf_dates = {d.date for d in pdf.days}
-        if sample and first and last:
-            # サンプルDMは「水曜〜翌週火曜」の平日5日分
-            exp_dates = {first + dt.timedelta(days=k) for k in (0, 1, 2, 5, 6)}
-            if first.weekday() != 2 or (last - first).days != 6:
-                add("中", CAT7, first, "", "掲載期間", f"{fmt_date(first)}〜{fmt_date(last)}", "水曜〜翌週火曜",
-                    f"サンプルDMは水曜〜翌週火曜の期間ですが、PDFは{fmt_date(first)}（{WEEKDAY_JA[first.weekday()]}）〜"
-                    f"{fmt_date(last)}（{WEEKDAY_JA[last.weekday()]}）になっています")
-                mark(CAT7, False)
-            elif pdf_dates != exp_dates:
-                miss = sorted(exp_dates - pdf_dates)
-                add("高", CAT7, miss[0] if miss else first, "", "掲載漏れ",
+        if sample and sample_menu and sample_menu["dates"]:
+            # サンプルDMは、サンプルメニューPDFの最初の週（例：水曜〜翌週火曜）の5日分。開始の曜日は店舗で変わる
+            exp_dates = set(sample_menu["dates"][:5])
+            if pdf_dates != exp_dates:
+                add("高", CAT7, first, "", "掲載期間",
                     "、".join(fmt_date(x) for x in sorted(pdf_dates)), "、".join(fmt_date(x) for x in sorted(exp_dates)),
-                    "サンプルDMは水・木・金・月・火の5日分を載せる決まりですが、日付が足りないか余分な日があります")
+                    "サンプルDMの日付は、サンプルメニューPDFの最初の5日分になるはずですが、日付が合いません")
                 mark(CAT7, False)
         for dd, md in sorted(masters.items()):
             if sample:   # サンプルDMは月別マスタと照合しない
@@ -2429,15 +2508,37 @@ def write_report(pdf: PdfDoc, findings: list, status: dict, masters: dict, notes
 # ----------------------------------------------------------------------------
 # 校正の実行
 # ----------------------------------------------------------------------------
-def run_one(name: str, data: bytes, src: MasterSource, cfg: Config) -> dict:
+def run_one(name: str, data: bytes, src: MasterSource, cfg: Config, sample_files: Optional[list] = None) -> dict:
     src.notes = []
     pdf = read_pdf(data, name, cfg)
+    sample_menu = None
+    if is_sample_dm(pdf):
+        menus = []
+        for sf_name, sf_data in sample_files or []:
+            try:
+                sm = read_sample_menu(sf_data, sf_name, pdf.days[0].year if pdf.days else None)
+            except Exception as e:  # 読めないPDFは飛ばす
+                src.notes.append(f"サンプルメニューPDF「{sf_name}」を読めませんでした：{e}")
+                continue
+            if sm["menu"]:
+                sm["name"] = sf_name
+                menus.append(sm)
+            else:
+                src.notes.append(f"サンプルメニューPDF「{sf_name}」からカレンダー（日付ごとのメニュー）を読み取れませんでした")
+        sample_menu = pick_sample_menu(pdf, menus)
+        if not sample_files:
+            src.notes.append("サンプルDMです。「サンプルメニューPDF」に店舗のサンプルメニュー（YDOPパンフなど）を入れると、メニューも照合します")
+        elif menus and not sample_menu:
+            src.notes.append("サンプルメニューPDFが複数あり、この原稿の店舗に合うものを選べませんでした（ファイル名に店舗名を入れてください）")
     masters = {}
     for y, m in sorted({(d.year, d.month) for d in pdf.days if d.year}):
         masters.update(src.monthly(y, m))
     fax = src.faxdm()
     stores = src.stores() if pdf.individual else None
-    findings, status = run_checks(pdf, masters, fax, cfg, stores)
+    findings, status = run_checks(pdf, masters, fax, cfg, stores, sample_menu)
+    if sample_menu:
+        src.notes.append(f"サンプルDMのため、メニューは月別マスタではなくサンプルメニューPDF「{sample_menu['name']}」"
+                         f"（{sample_menu['page']}ページ目）と照合しました")
     notes = list(dict.fromkeys(src.notes))
     excel = write_report(pdf, findings, status, masters, notes)
     used = sorted({m.source for m in masters.values()}) + ([STORE_TAB] if stores else [])
@@ -2580,13 +2681,18 @@ def main():
             st.markdown("**重要度**：高＝誤りの可能性大／中＝要確認／低＝スペースや記号の細部／情報＝参考")
 
     pdfs = st.file_uploader("PDF原稿（複数可）", type=["pdf"], accept_multiple_files=True)
+    sample_pdfs = st.file_uploader(
+        "サンプルメニューPDF（新店舗用のサンプルDMを校正するときだけ）", type=["pdf"], accept_multiple_files=True,
+        help="店舗ごとのサンプルメニュー（YDOPパンフなど）。ファイル名に「新店舗用」「サンプル」が入ったDMは、"
+             "月別マスタではなくこのPDFのカレンダーと日付ごとに照合します。複数の店舗を入れるときは、ファイル名に店舗名を入れてください")
     if st.button("校正する", type="primary", disabled=not pdfs):
         src = MasterSource(provider, cfg)
         results = []
         with st.spinner("校正中…"):
             for f in pdfs:
                 try:
-                    results.append(run_one(f.name, f.getvalue(), src, cfg))
+                    results.append(run_one(f.name, f.getvalue(), src, cfg,
+                                           [(sf.name, sf.getvalue()) for sf in sample_pdfs or []]))
                 except Exception as e:
                     results.append({"name": f.name, "error": str(e)})
         st.session_state["results"] = results
