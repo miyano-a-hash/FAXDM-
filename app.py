@@ -836,13 +836,102 @@ class PdfDoc:
         return bool(self.store.get("name")) and bool(self.store.get("tel") or self.store.get("address"))
 
 
+# ----------------------------------------------------------------------------
+# 目に見えない文字を除く
+#   ほかの図形の下に隠れている文字・透明の文字・白い背景の上の白い文字のうち、
+#   すぐ近くに見えている同じ文字があるもの（例：フェアの日付の色付き枠の下にある黒い「2」）
+# ----------------------------------------------------------------------------
+def _hidden_boxes(page) -> list:
+    """目に見えない文字の [(文字列, (x0, y0, x1, y1))]。PyMuPDF の描画順（seqno）を使う。
+    使えない環境では空（従来どおり全部の文字を読む）"""
+    hidden = []
+    try:
+        trace = page.get_texttrace()
+        draws = page.get_drawings()
+    except Exception:
+        return hidden
+    page_area = page.rect.width * page.rect.height
+    fills, covers = [], []   # fills：塗りのある図形（背景の判定用）、covers：文字を隠しうる図形
+    for d in draws:
+        fill, r = d.get("fill"), d.get("rect")
+        if fill is None or r is None or d.get("seqno") is None:
+            continue
+        if (d.get("fill_opacity") or 1) < 0.9 or r.width < 2 or r.height < 2:
+            continue
+        fills.append((d["seqno"], r, fill))
+        if r.width * r.height <= page_area * 0.05:   # 大きい枠や背景（穴あきの図形もある）は「隠す」判定に使わない
+            covers.append((d["seqno"], r, fill))
+    try:
+        images = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
+    except Exception:
+        images = []
+
+    def inside(r, x, y):
+        return r.x0 - 0.5 <= x <= r.x1 + 0.5 and r.y0 - 0.5 <= y <= r.y1 + 0.5
+
+    for t in trace:
+        seq = t.get("seqno")
+        bbox = t.get("bbox")
+        if seq is None or not bbox:
+            continue
+        text = "".join(chr(c[0]) for c in t.get("chars", []) if c and c[0] > 0)
+        if not text.strip():
+            continue
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        invisible = t.get("type") == 3 or (t.get("opacity") is not None and t.get("opacity") == 0)
+        covered = any(fs > seq and inside(r, cx, cy) for fs, r, _ in covers)
+        col = tuple(t.get("color") or (0, 0, 0))
+        if len(col) == 4:    # CMYK（印刷用の原稿）：白は 0,0,0,0
+            white = all(v < 0.03 for v in col)
+        else:                # RGB・グレー：白は 1
+            white = len(col) > 0 and all(v > 0.97 for v in col)
+        on_color = any(fs < seq and inside(r, cx, cy) and min(f) < 0.9 for fs, r, f in fills) \
+            or any(inside(im, cx, cy) for im in images)
+        if invisible or covered or (white and not on_color):
+            hidden.append((text, tuple(bbox), seq))
+    # 「乗算」などの効果で、図形が上にあっても文字が透けて見えることがある（イチオシ欄の日付など）。
+    # 確実に判断できる「すぐ近くに見えている同じ文字がある」重複だけを見えない文字として扱う
+    hidden_seq = {h[2] for h in hidden}
+    visible = []
+    for t in trace:
+        if t.get("seqno") in hidden_seq or not t.get("bbox"):
+            continue
+        vt = "".join(chr(c[0]) for c in t.get("chars", []) if c and c[0] > 0).strip()
+        if vt:
+            b_ = t["bbox"]
+            visible.append((vt, (b_[0] + b_[2]) / 2, (b_[1] + b_[3]) / 2))
+    out = []
+    for text, bb, _ in hidden:
+        cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+        tol = max(4.0, (bb[3] - bb[1]) * 0.3)
+        if any(vt == text.strip() and abs(vx - cx) < tol and abs(vy - cy) < tol for vt, vx, vy in visible):
+            out.append((text, bb))
+    return out
+
+
+def _is_hidden(text: str, bbox, hidden: list) -> bool:
+    t = text.strip()
+    if not t or not hidden:
+        return False
+    # 見えている文字が、隠れた文字のすぐ横（1〜2ポイント）にあることがあるので、位置はほぼ一致するものだけ
+    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    for ht, hb in hidden:
+        hcx, hcy = (hb[0] + hb[2]) / 2, (hb[1] + hb[3]) / 2
+        same_place = abs(cx - hcx) < 0.8 and abs(cy - hcy) < 0.8
+        within = hb[0] - 0.5 <= bbox[0] and bbox[2] <= hb[2] + 0.5 and hb[1] - 0.5 <= bbox[1] and bbox[3] <= hb[3] + 0.5
+        if (same_place and t == ht.strip()) or (within and t in ht):
+            return True
+    return False
+
+
 def _spans(page) -> list:
     out = []
+    hidden = _hidden_boxes(page)
     for b in page.get_text("dict")["blocks"]:
         for l in b.get("lines", []):
             for s in l["spans"]:
                 t = s["text"]
-                if not t.strip():
+                if not t.strip() or _is_hidden(t, s["bbox"], hidden):   # 目に見えない文字は読まない
                     continue
                 x0, y0, x1, y1 = s["bbox"]
                 out.append(Span(t, x0, y0, x1, y1, s["size"], s["font"], s["color"]))
@@ -922,9 +1011,12 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
     title = (doc.metadata or {}).get("title") or ""
     spans = _spans(page)
     # 同じ文字が同じ位置に重ねてある場合（黒と白の重ね、同じ文字の二重描画など）は1つだけ使う（黒を優先）
+    # 縁取り用の白い文字は1.5〜2ポイントほどずらして重ねてあることがある（例：日付「2」、曜日「㊌」）。
+    # ずれの許容は文字の大きさに合わせる（20ptの日付なら3ポイントまで）
     keep = []
     for x in sorted(spans, key=lambda s: s.white):
-        if not any(k.text == x.text and abs(k.x0 - x.x0) < 1.5 and abs(k.y0 - x.y0) < 1.5 for k in keep):
+        tol = max(2.0, x.size * 0.15)
+        if not any(k.text == x.text and abs(k.x0 - x.x0) < tol and abs(k.y0 - x.y0) < tol for k in keep):
             keep.append(x)
     keep_ids = {id(x) for x in keep}
     spans = [x for x in spans if id(x) in keep_ids]
@@ -1074,6 +1166,12 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             continue
         cl = col_lefts[c]
         cw = col_right(c) - cl
+        # 区切り線は「この列の左端から始まり、列の幅の半分以上ある横線」。
+        # 注文欄が1列だけの原稿（見出し「2026年11月/12月」）は、列の右端がページの端になって幅が実際より広く出るので、
+        # 列の左端から始まる一番長い横線を注文欄の幅とみなす
+        starts = [x1 for y, x0, x1 in hlines if grid_top - 2 < y < grid_bottom + 2 and x0 <= cl + 12 and x1 <= cl + cw + 3]
+        if starts and c == len(col_lefts) - 1:   # 一番右の列だけ（右端がページの端になるため）
+            cw = min(cw, max(starts) - cl)
         ys = sorted(y for y, x0, x1 in hlines
                     if grid_top - 2 < y < grid_bottom + 2 and x0 <= cl + 12 and x1 >= cl + cw * 0.5)
         uniq = []
@@ -1087,12 +1185,14 @@ def read_pdf(data: bytes, name: str, cfg: Config) -> PdfDoc:
             above = [y for y in uniq if y <= d.top + 2 and d.top - y < gap]
             below = [y for y in uniq if y > d.top + 2 and y - d.top < gap * 1.2]
             lead = gap * 0.28
+            # 区切り線のすぐ上の行は、文字の下の部分が線にかかることがある（例：12/3の最後の行）。
+            # 文字の中心が線より少し下（2ポイントまで）でも上の日に入れる
             if above:
-                top = above[-1] - 1
+                top = above[-1] + 2
             else:  # 罫線が取れない場合の目安
                 top = max(d.top - lead, prev_bot) if prev_bot else d.top - lead
             if below:
-                bot = below[0] - 1
+                bot = below[0] + 2
             else:
                 bot = cd[i + 1].top - lead if i + 1 < len(cd) else min(d.top + gap, grid_bottom)
             cell_bounds[id(d)] = (max(top, grid_top), bot)
@@ -1324,9 +1424,10 @@ ZEITAKU_PREFIX = "こだわりの逸品"
 
 def _page_lines(page) -> list:
     out = []
+    hidden = _hidden_boxes(page)
     for b in page.get_text("dict")["blocks"]:
         for l in b.get("lines", []):
-            sp = [x for x in l["spans"] if x["text"].strip()]
+            sp = [x for x in l["spans"] if x["text"].strip() and not _is_hidden(x["text"], x["bbox"], hidden)]
             if not sp:
                 continue
             out.append(dict(t="".join(x["text"] for x in sp),
