@@ -1994,31 +1994,64 @@ def store_name_from_filename(name: str) -> str:
     return " ".join(toks).strip()
 
 
-def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str):
-    """ファイル名の店舗名と、原稿下部の店舗情報の店舗名が合っているか"""
+def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str) -> str:
+    """ファイル名の店舗名・原稿下部の店舗名・店舗マスタの店舗名の3つがそろっているか。
+    原稿下部と店舗マスタの照合は _check_store で行うので、ここではファイル名との食い違いを見る。
+    戻り値：3つを並べた説明（⑨の詳細欄に表示）"""
     fn = store_name_from_filename(pdf.path or pdf.title or "")
     pn = pdf.store.get("name", "")
+    row = find_store(pdf.store, stores)[0] if stores else None
+    if row is None and stores and fn:   # 原稿から特定できないときは、ファイル名の店舗名でマスタを探す
+        row = find_store({"name": fn}, stores)[0]
+    mn = (row.official or row.name) if row else ""
+    summary = (f"ファイル名「{fn or '（店舗名なし）'}」／原稿「{pn or '（読めず）'}」"
+               + (f"／マスタ「{mn}」（{row.row}行目）" if row else ("／マスタ「（該当なし）」" if stores else "")))
     if not fn or not pn:
-        return
-    fk, pk = _norm_key(fn).lower(), _norm_key(pn).lower()
-    if fk in pk or pk in fk:
-        return
-    # 店舗マスタで同じ店舗の別の呼び名（C列の店舗名・D列の正式店舗名）なら「中」
-    row = None
-    if stores:
-        row, _ = find_store(pdf.store, stores)
-    if row and any(_norm_key(x).lower() and (fk in _norm_key(x).lower() or _norm_key(x).lower() in fk)
-                   for x in (row.name, row.official)):
+        return summary
+
+    def key(x):
+        return _norm_key(x).lower()
+
+    def same(a, b):
+        a, b = key(a), key(b)
+        return bool(a and b) and (a in b or b in a)
+
+    def fn_in(x):
+        """ファイル名の店舗名が x の一部か（「GOZEN」→「GOZEN（岡山市エリア）」はOK、「インパム本店」→「インパム」はNG）"""
+        return bool(key(fn) and key(x)) and key(fn) in key(x)
+
+    fn_pdf = fn_in(pn)
+    fn_master = row is not None and any(fn_in(x) for x in (row.name, row.official))
+    if fn_pdf and (row is None or fn_master):
+        return summary
+    if row is not None and fn_master and not fn_pdf and any(same(pn, x) for x in (row.name, row.official)):
+        # 3つとも同じ店舗だが、C列（店舗名）とD列（正式店舗名）で呼び名が違う
         add("中", cat, None, "", "ファイル名の店舗名", fn, pn,
-            f"ファイル名の店舗名「{fn}」と原稿下部の店舗名「{pn}」の表記が違います"
-            f"（店舗マスタ {row.row}行目では同じ店舗の呼び名です：C列「{row.name}」／D列「{row.official}」）")
+            f"ファイル名「{fn}」と原稿下部「{pn}」の店舗名の表記が違います。店舗マスタでは同じ店舗です"
+            f"（C列「{row.name}」／D列「{row.official}」）。どちらの表記にそろえるか確認してください［店舗マスタ {row.row}行目］")
         mark(cat, False)
-        return
-    ratio = difflib.SequenceMatcher(None, fk, pk).ratio()
-    add("高" if ratio < 0.5 else "中", cat, None, "", "ファイル名の店舗名", fn, pn,
-        f"ファイル名の店舗名「{fn}」と原稿下部の店舗名「{pn}」が一致しません"
-        + ("。別の店舗の店舗情報が入っていないか確認してください" if ratio < 0.5 else "（表記の違いか確認してください）"))
+        return summary
+    if row is not None and fn_master and not fn_pdf:
+        # ファイル名はマスタどおり。原稿下部の店舗名がマスタと違う（_check_store でも指摘される）
+        add("中", cat, None, "", "ファイル名の店舗名", fn, pn,
+            f"ファイル名の店舗名「{fn}」はマスタ（C列「{row.name}」／D列「{row.official}」）と合っていますが、"
+            f"原稿下部の店舗名「{pn}」と表記が違います［店舗マスタ {row.row}行目］")
+        mark(cat, False)
+        return summary
+    if row is not None and fn_pdf and not fn_master:
+        add("中", cat, None, "", "ファイル名の店舗名", fn, mn,
+            f"ファイル名の店舗名「{fn}」は原稿下部と合っていますが、店舗マスタのC列「{row.name}」／D列「{row.official}」と"
+            f"表記が違います［店舗マスタ {row.row}行目］")
+        mark(cat, False)
+        return summary
+    # ファイル名が原稿ともマスタとも合わない
+    ratio = difflib.SequenceMatcher(None, key(fn), key(pn)).ratio()
+    add("高" if ratio < 0.5 else "中", cat, None, "", "ファイル名の店舗名", fn, pn + (f"（マスタ：{mn}）" if mn else ""),
+        f"ファイル名の店舗名「{fn}」が、原稿下部の店舗名「{pn}」"
+        + (f"とも店舗マスタの「{mn}」とも" if mn else "と") + "一致しません"
+        + ("。別の店舗の原稿・店舗情報になっていないか確認してください" if ratio < 0.5 else "（表記の違いか確認してください）"))
     mark(cat, False)
+    return summary
 
 
 def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
@@ -2538,7 +2571,10 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             status[CAT9] = ("要確認", "店舗マスタが読み込めないためチェックできません")
         else:
             _check_store(pdf, stores, add, mark, CAT9)
-        _check_filename_store(pdf, stores, add, mark, CAT9)   # ファイル名の店舗名と原稿の店舗名
+        names = _check_filename_store(pdf, stores, add, mark, CAT9)   # ファイル名・原稿・マスタの店舗名
+        if names:
+            res, det = status[CAT9]
+            status[CAT9] = (res, names + (f"　{det}" if det else ""))
 
     if pdf.menu_only:  # メニュー欄だけ照合するレイアウト
         keep = [CAT1, CAT2, CAT7] + [k for k in status if k.startswith("⑨")]
