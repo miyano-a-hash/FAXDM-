@@ -19,6 +19,7 @@ PDF原稿をアップロードすると、月別マスタ（YYMM_やどかり）
 from __future__ import annotations
 
 import datetime as dt
+import difflib
 import io
 import re
 import statistics
@@ -1972,6 +1973,54 @@ def find_store(pdf_store: dict, stores: list):
     return None, ""
 
 
+def store_name_from_filename(name: str) -> str:
+    """ファイル名から店舗名を取り出す（「様」の前）。
+    例：「261221配信　261222-25（個別）管理栄養士のLUNCH BOX様」→「管理栄養士のLUNCH BOX」
+        「新店舗用_FAXDM①261209-15　インパムキッチン様　261209OP」→「インパムキッチン」
+        「261127配信　261130-1204_新店260624OP_きずな弁当様」→「きずな弁当」"""
+    t = unicodedata.normalize("NFKC", (name or "").rsplit("/", 1)[-1])
+    t = re.sub(r"\.pdf$", "", t, flags=re.IGNORECASE)
+    if "様" not in t:
+        return ""
+    t = t[:t.rindex("様")]
+    # 区切り（_ や（個別）の閉じかっこ）より後ろだけ
+    for sep in ["_", ")", "]", "】", "」", "』"]:
+        if sep in t:
+            t = t[t.rindex(sep) + 1:]
+    # 前に付いている日付・期間・「FAXDM①」などの言葉を外す（店舗名の中の空白は残す）
+    toks = t.split()
+    while toks and (re.search(r"\d", toks[0]) or re.fullmatch(r"(?i)faxdm.*|新店舗用.*|新店.*|個別.*|配信.*", toks[0])):
+        toks.pop(0)
+    return " ".join(toks).strip()
+
+
+def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str):
+    """ファイル名の店舗名と、原稿下部の店舗情報の店舗名が合っているか"""
+    fn = store_name_from_filename(pdf.path or pdf.title or "")
+    pn = pdf.store.get("name", "")
+    if not fn or not pn:
+        return
+    fk, pk = _norm_key(fn).lower(), _norm_key(pn).lower()
+    if fk in pk or pk in fk:
+        return
+    # 店舗マスタで同じ店舗の別の呼び名（C列の店舗名・D列の正式店舗名）なら「中」
+    row = None
+    if stores:
+        row, _ = find_store(pdf.store, stores)
+    if row and any(_norm_key(x).lower() and (fk in _norm_key(x).lower() or _norm_key(x).lower() in fk)
+                   for x in (row.name, row.official)):
+        add("中", cat, None, "", "ファイル名の店舗名", fn, pn,
+            f"ファイル名の店舗名「{fn}」と原稿下部の店舗名「{pn}」の表記が違います"
+            f"（店舗マスタ {row.row}行目では同じ店舗の呼び名です：C列「{row.name}」／D列「{row.official}」）")
+        mark(cat, False)
+        return
+    ratio = difflib.SequenceMatcher(None, fk, pk).ratio()
+    add("高" if ratio < 0.5 else "中", cat, None, "", "ファイル名の店舗名", fn, pn,
+        f"ファイル名の店舗名「{fn}」と原稿下部の店舗名「{pn}」が一致しません"
+        + ("。別の店舗の店舗情報が入っていないか確認してください" if ratio < 0.5 else "（表記の違いか確認してください）"))
+    mark(cat, False)
+
+
 def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
     ps = pdf.store
     row, how = find_store(ps, stores)
@@ -2489,6 +2538,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
             status[CAT9] = ("要確認", "店舗マスタが読み込めないためチェックできません")
         else:
             _check_store(pdf, stores, add, mark, CAT9)
+        _check_filename_store(pdf, stores, add, mark, CAT9)   # ファイル名の店舗名と原稿の店舗名
 
     if pdf.menu_only:  # メニュー欄だけ照合するレイアウト
         keep = [CAT1, CAT2, CAT7] + [k for k in status if k.startswith("⑨")]
