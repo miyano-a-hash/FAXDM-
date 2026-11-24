@@ -109,10 +109,21 @@ MENU_FIELDS = ["main", "submain", "fukusai1", "fukusai2", "salad"]
 # 副菜をまとめて書く原稿（新店舗用のサンプルDMなど）の表記。これらは副菜・サラダの照合をしない
 SIDE_PLACEHOLDERS = {"その他副菜", "その他の副菜", "ほか副菜", "他副菜"}
 
-# 新店舗用のサンプルDM：ファイル名にこの言葉があればサンプルDMとして扱う
-SAMPLE_WORDS = ["新店舗用", "サンプル"]
+# 新店舗用のDMの見分け方（ファイル名）
+#   新店舗用_FAXDM① → サンプルメニューのDM（月別マスタではなくサンプルメニュー（マスタ）と照合）
+#   新店舗用_FAXDM② → 通常のDM（月別マスタと照合）
+# ファイル名に「サンプル」が入っているものもサンプルメニューのDMとして扱う
+SAMPLE_DM_PATTERN = r"新店舗用[_＿\s　]*FAXDM[\s　]*[①1１]"
+SAMPLE_WORDS = ["サンプル"]
+
+
 def is_sample_dm(pdf) -> bool:
-    return any(w in (pdf.path or "") or w in (pdf.title or "") for w in SAMPLE_WORDS)
+    for name in (pdf.path or "", pdf.title or ""):
+        if re.search(SAMPLE_DM_PATTERN, name, re.IGNORECASE):
+            return True
+        if any(w in name for w in SAMPLE_WORDS):
+            return True
+    return False
 
 
 def _sample_key(s: str) -> str:
@@ -2779,7 +2790,7 @@ def main():
                    "ここに入れた店舗のサンプルメニュー（YDOPパンフ）を**正**として照合します。")
         sample_pdfs = st.file_uploader(
             "サンプルメニューのPDF", type=["pdf"], accept_multiple_files=True,
-            help="例：YDOPパンフ_インパムキッチン_1209.pdf。ファイル名に「新店舗用」「サンプル」が入ったDMが対象です。"
+            help="例：YDOPパンフ_インパムキッチン_1209.pdf。ファイル名が「新店舗用_FAXDM①」のDMが対象です（②は通常どおり月別マスタと照合）。"
                  "複数の店舗をまとめて校正するときは、ファイル名に店舗名を入れてください（DMと自動で組み合わせます）")
         with st.expander("判定ルール"):
             st.markdown("**アイコンの色（ラベル列）**")
