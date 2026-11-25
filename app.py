@@ -110,21 +110,16 @@ MENU_FIELDS = ["main", "submain", "fukusai1", "fukusai2", "salad"]
 # 副菜をまとめて書く原稿（新店舗用のサンプルDMなど）の表記。これらは副菜・サラダの照合をしない
 SIDE_PLACEHOLDERS = {"その他副菜", "その他の副菜", "ほか副菜", "他副菜"}
 
-# 新店舗用のDMの見分け方（ファイル名）
+# 新店舗用のDMの見分け方（ファイル名だけで判定する）
 #   新店舗用_FAXDM① → サンプルメニューのDM（月別マスタではなくサンプルメニュー（マスタ）と照合）
 #   新店舗用_FAXDM② → 通常のDM（月別マスタと照合）
-# ファイル名に「サンプル」が入っているものもサンプルメニューのDMとして扱う
+# ※PDFの中の文書タイトル（Illustratorで付く「◯◯様用サンプル」など）は見ない
 SAMPLE_DM_PATTERN = r"新店舗用[_＿\s　]*FAXDM[\s　]*[①1１]"
-SAMPLE_WORDS = ["サンプル"]
 
 
 def is_sample_dm(pdf) -> bool:
-    for name in (pdf.path or "", pdf.title or ""):
-        if re.search(SAMPLE_DM_PATTERN, name, re.IGNORECASE):
-            return True
-        if any(w in name for w in SAMPLE_WORDS):
-            return True
-    return False
+    name = (pdf.path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(re.search(SAMPLE_DM_PATTERN, name, re.IGNORECASE))
 
 
 def _sample_key(s: str) -> str:
@@ -210,7 +205,7 @@ def pick_sample_menu(pdf, menus: list):
         return None
     if len(menus) == 1:
         return menus[0]
-    key = unicodedata.normalize("NFKC", (pdf.path or "") + " " + (pdf.title or ""))
+    key = unicodedata.normalize("NFKC", pdf.path or "")
     for mn in menus:
         toks = re.split(r"[_\s　\-（）()]+", unicodedata.normalize("NFKC", mn["name"].rsplit(".", 1)[0]))
         if any(len(t) >= 3 and not re.fullmatch(r"[\dA-Za-z]+(パンフ)?", t) and t in key for t in toks):
@@ -2020,7 +2015,7 @@ def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str) -> str:
     """ファイル名の店舗名・原稿下部の店舗名・店舗マスタの店舗名の3つがそろっているか。
     原稿下部と店舗マスタの照合は _check_store で行うので、ここではファイル名との食い違いを見る。
     戻り値：3つを並べた説明（⑨の詳細欄に表示）"""
-    fn = store_name_from_filename(pdf.path or pdf.title or "")
+    fn = store_name_from_filename(pdf.path or "")
     pn = pdf.store.get("name", "")
     row = find_store(pdf.store, stores)[0] if stores else None
     if row is None and stores and fn:   # 原稿から特定できないときは、ファイル名の店舗名でマスタを探す
