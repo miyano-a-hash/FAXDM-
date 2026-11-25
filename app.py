@@ -837,6 +837,7 @@ class PdfDoc:
     price_labels: list = field(default_factory=list)   # 価格欄の弁当名（上から・左から）
     menu_only: bool = False                         # メニュー名だけ照合するレイアウト（2週間分ヨコ・オリジナル など）
     header_note: tuple = ()                         # 注文欄の見出しの年月が掲載期間と合わないとき（PDFの表記, 正しい表記）
+    page_png: bytes = b""                           # 電話・FAX番号が文字で読めないときの確認用（原稿を画像にしたもの）
 
     @property
     def individual(self) -> bool:
@@ -1615,7 +1616,9 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
         period = _period_no_send(name) or _period_no_send(title)
     # 注文欄（日付・メニュー）の範囲。価格・店舗欄を探すときはここを除く
     grid = (min(a["x0"] for a in anchors) - 5, anchors[0]["y0"] - h * 0.6, page_w, anchors[-1]["y1"] + h * 0.6)
-    outside = [l for l in L if not (l["x1"] > grid[0] and grid[1] < l["y1"] and l["y0"] < grid[3])]
+    # 注文欄の外の文字。大きな文字（例：FAX番号）は枠が上下に大きく取られて注文欄にかかることがあるので、
+    # 文字の中心が注文欄の中にあるかで判定する
+    outside = [l for l in L if not (l["x1"] > grid[0] and grid[1] < (l["y0"] + l["y1"]) / 2 < grid[3])]
     store = _simple_store(L, outside)
     prices = _simple_prices(outside)
     qr_urls, qr_note = _read_qr(page)
@@ -1824,7 +1827,8 @@ def _read_store_block(spans: list, grid_bottom: float) -> dict:
     stop = [s.y0 for s in spans if ("FAX不要" in s.text or "不要連絡" in s.text) and s.y0 > y_from]
     y_to = min(stop) - 2 if stop else 1e9
     skip = ("法人名", "ご住所", "ご担当者", "部署名", "ビル名", "配信停止", "不要連絡", "お問い合わせ", "ご注文", "前日")
-    foot = [s for s in spans if y_from <= s.y0 < y_to and not s.white and not any(k in s.text for k in skip)]
+    # 大きな文字（FAX番号など）は枠が上に大きく取られることがあるので、文字の中心で範囲を判定する
+    foot = [s for s in spans if y_from <= s.yc < y_to and not s.white and not any(k in s.text for k in skip)]
     text_all = unicodedata.normalize("NFKC", "".join(s.text for s in sorted(foot, key=lambda s: (round(s.y0), s.x0))))
     out = {}
     m = re.search(r"TEL[:：]?\s*(\d{2,5}-\d{1,4}-\d{3,4})", text_all)
@@ -1832,6 +1836,7 @@ def _read_store_block(spans: list, grid_bottom: float) -> dict:
         out["tel"] = m.group(1)
     phones = [(s, PHONE_RE.search(unicodedata.normalize("NFKC", s.text))) for s in foot]
     faxes = [(s, mm.group(1)) for s, mm in phones if mm and mm.group(1) not in COMMON_PHONES
+             and mm.group(1) != out.get("tel")    # TELの番号の方が大きな文字のこともある
              and "TEL" not in unicodedata.normalize("NFKC", s.text).upper()]
     if faxes:
         out["fax"] = max(faxes, key=lambda x: x[0].size)[1]
@@ -2071,6 +2076,52 @@ def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str) -> str:
     return summary
 
 
+def ocr_available() -> bool:
+    """画像から文字を読み取る仕組み（Tesseract）が使えるか"""
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def render_page_png(data: bytes) -> bytes:
+    """原稿の1ページ目を画像（300dpi・グレー）にする"""
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+        pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(300 / 72, 300 / 72), colorspace=pymupdf.csGRAY)
+        return pix.tobytes("png")
+    except Exception:
+        return b""
+
+
+def find_number_in_image(png: bytes, number: str) -> Optional[bool]:
+    """原稿の画像の中に、その電話・FAX番号（数字だけで比べる）があるか。
+    図形化された番号を読むための最後の手段。読み取りは「7」と「1」などを間違えることがあるので、
+    番号を読むのではなく「マスタの番号が見つかるか」を確かめる。見つかれば True、見つからなければ False、
+    読み取りの仕組みが使えなければ None"""
+    target = re.sub(r"\D", "", number or "")
+    if not png or len(target) < 9:
+        return None
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(io.BytesIO(png)).convert("L")
+    except Exception:
+        return None
+    bw = img.point(lambda v: 255 if v > 160 else 0)
+    # 効果のあった読み取り方を順に試し、見つかった時点で終わる
+    for im, cfg in ((img, "--psm 11"), (bw, "--psm 6"), (img, "--psm 6"), (bw, "--psm 11")):
+        try:
+            txt = pytesseract.image_to_string(im, lang="eng", config=cfg)
+        except Exception:
+            return None
+        if target in re.sub(r"\D", "", txt):
+            return True
+    return False
+
+
 def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
     ps = pdf.store
     row, how = find_store(ps, stores)
@@ -2104,9 +2155,22 @@ def _check_store(pdf: PdfDoc, stores: list, add, mark, cat: str):
         if _digits(pv) != _digits(mv):
             if pdf.menu_only and not pv and lab == "FAX番号" and ps.get("web_only"):
                 continue  # WEB注文だけの原稿はFAX番号を載せない（問題なし）
+            if not pv and mv and pdf.page_png:
+                # 番号が文字として読めない（図形化されているなど）：原稿を画像にして、マスタの番号があるか探す
+                found = find_number_in_image(pdf.page_png, mv)
+                if found:
+                    add("情報", cat, None, "", lab, f"（画像で確認）{mv}", mv,
+                        f"{lab}が文字として読めないため、原稿を画像にして探したところ、マスタの{col}と同じ番号が見つかりました［{ref}］")
+                    continue
+                if found is False:
+                    add("中", cat, None, "", lab, "（画像でも見つからず）", mv,
+                        f"{lab}が文字として読めないため、原稿を画像にして探しましたが、マスタの{col}「{mv}」が見つかりません。"
+                        f"番号の誤り、または画像からうまく読み取れなかった可能性があります（原稿を目視確認）［{ref}］")
+                    mark(cat, False)
+                    continue
             if pdf.menu_only and not pv and lab == "FAX番号":
                 # 指摘にはせず、照合できなかったことをメッセージで知らせる（間違っていても気付けるように）
-                pdf.warnings.append(f"FAX番号が図形化されていて文字として読めないため、照合していません。"
+                pdf.warnings.append(f"原稿からFAX番号を読み取れなかったため（図形化されているなど）、照合していません。"
                                     f"原稿のFAX番号を目視で確認してください（マスタのF列：{mv}）［{ref}］")
                 continue
             if pdf.menu_only and not pv:  # このレイアウトは番号が図形（アウトライン）のことがある
@@ -2734,6 +2798,8 @@ def write_report(pdf: PdfDoc, findings: list, status: dict, masters: dict, notes
 def run_one(name: str, data: bytes, src: MasterSource, cfg: Config, sample_files: Optional[list] = None) -> dict:
     src.notes = []
     pdf = read_pdf(data, name, cfg)
+    if pdf.individual and not (pdf.store.get("tel") and pdf.store.get("fax")) and ocr_available():
+        pdf.page_png = render_page_png(data)   # 文字で読めない電話・FAX番号を画像で確かめるため
     sample_menu = None
     if is_sample_dm(pdf):
         menus = []
