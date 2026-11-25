@@ -1978,20 +1978,42 @@ def store_name_from_filename(name: str) -> str:
     例：「261221配信　261222-25（個別）管理栄養士のLUNCH BOX様」→「管理栄養士のLUNCH BOX」
         「新店舗用_FAXDM①261209-15　インパムキッチン様　261209OP」→「インパムキッチン」
         「261127配信　261130-1204_新店260624OP_きずな弁当様」→「きずな弁当」"""
-    t = unicodedata.normalize("NFKC", (name or "").rsplit("/", 1)[-1])
+    # 「FAXDM①」の「①」は正規化で「1」になり日付とくっつくので、先に外す
+    t = unicodedata.normalize("NFKC", re.sub(r"[\u2460-\u2473\u24EA\u2776-\u277F]", " ", (name or "").rsplit("/", 1)[-1]))
     t = re.sub(r"\.pdf$", "", t, flags=re.IGNORECASE)
     if "様" not in t:
         return ""
     t = t[:t.rindex("様")]
-    # 区切り（_ や（個別）の閉じかっこ）より後ろだけ
-    for sep in ["_", ")", "]", "】", "」", "』"]:
-        if sep in t:
-            t = t[t.rindex(sep) + 1:]
+    # 区切り（_ や「（個別）」の閉じかっこ）より後ろだけ。
+    # ただし店舗名の最後にあるかっこ（例：「NANAIRODELI本宮店（ナナイロデリ本宮店）」「GOZEN（岡山市エリア）」）は店舗名の一部
+    t = t.strip()
+    if "_" in t:
+        t = t[t.rindex("_") + 1:].strip()
+    closes = [i for i, ch in enumerate(t) if ch in ")]】」』" and i < len(t) - 1]
+    if closes:
+        t = t[closes[-1] + 1:]
     # 前に付いている日付・期間・「FAXDM①」などの言葉を外す（店舗名の中の空白は残す）
+    # 先頭にある日付・期間・「新店舗用」「FAXDM①」などの決まった部分だけを、1つずつ外す
+    # （「3丁目弁当」のように数字で始まる店舗名は残す）
+    head = re.compile(r"(?i)^(新店舗用|新店\d*(?:OP|オープン)?|個別|配信|faxdm[①-⑳]?|[①-⑳]"
+                      r"|\d{6}\s*-\s*\d{1,4}(?:[.・,、]\d{1,2})*"          # 261207-11・261208-21.25
+                      r"|\d{4,6}(?:配信|OP|オープン)?(?!\d)"                 # 261204配信・261125OP
+                      r"|\d{1,2}[/月]\d{1,2}日?(?:\s*[-〜~]\s*\d{1,2}(?:[/月]\d{1,2})?日?)?"   # 12/7-11
+                      r")[\s_・]*")
+    t = t.strip()
+    while True:
+        m_ = head.match(t)
+        if not m_ or not m_.group(0):
+            break
+        rest = t[m_.end():].strip()
+        if not rest:
+            break
+        t = rest
     toks = t.split()
-    while toks and (re.search(r"\d", toks[0]) or re.fullmatch(r"(?i)faxdm.*|新店舗用.*|新店.*|個別.*|配信.*", toks[0])):
-        toks.pop(0)
-    return " ".join(toks).strip()
+    out = " ".join(toks).strip()
+    if "（" in (name or ""):   # 表示はファイル名どおり全角のかっこにする
+        out = out.replace("(", "（").replace(")", "）")
+    return out
 
 
 def _check_filename_store(pdf: PdfDoc, stores, add, mark, cat: str) -> str:
@@ -2572,9 +2594,17 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         else:
             _check_store(pdf, stores, add, mark, CAT9)
         names = _check_filename_store(pdf, stores, add, mark, CAT9)   # ファイル名・原稿・マスタの店舗名
+        res, det = status[CAT9]
+        # どの項目で指摘が出たかを詳細欄の先頭に書く（店舗名が合っていても、住所やQRで「要確認」になることがある）
+        flagged = list(dict.fromkeys(f.item for f in F if f.category == CAT9 and f.severity in ("高", "中", "低")))
+        parts = []
+        if flagged:
+            parts.append("要確認：" + "・".join(flagged) + "（指摘一覧を見てください）")
+        if det:
+            parts.append(det)
         if names:
-            res, det = status[CAT9]
-            status[CAT9] = (res, names + (f"　{det}" if det else ""))
+            parts.append("店舗名　" + names)
+        status[CAT9] = (res, "　".join(parts))
 
     if pdf.menu_only:  # メニュー欄だけ照合するレイアウト
         keep = [CAT1, CAT2, CAT7] + [k for k in status if k.startswith("⑨")]
