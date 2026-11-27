@@ -1451,6 +1451,12 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
     L = _page_lines(page)
     wd_re = "[" + "".join(WEEKDAY_CHARS) + "]"
     anchors = [l for l in L if l["size"] >= 14 and re.match(r"^(\d{1,2}/)?\d{1,2}" + wd_re + "?$", l["t"].replace(" ", ""))]
+    # 「00」など、日付としてありえない数字は除く（原稿に隠れて残ったひな形の文字など）
+    bad = [l for l in anchors if not 1 <= int(re.findall(r"\d+", l["t"])[-1]) <= 31]
+    if bad:
+        anchors = [l for l in anchors if l not in bad]
+        warnings.append("日付として読めない数字（" + "、".join(l["t"].strip() for l in bad)
+                        + "）があったため除外しました。原稿に見えない文字（ひな形の残りなど）がないか確認してください")
     if len(anchors) < 2:
         return None
     anchors.sort(key=lambda a: a["y0"])
@@ -1542,12 +1548,17 @@ def _read_pdf_simple(page, name: str, title: str, period, warnings: list, fullte
                     assign[id(l)] = next(iter(cnt))
         # どの日付の範囲にも入らない行は、メニュー欄の左端から書き始めていて、範囲からのはみ出しが
         # わずかな行だけ入れる（欄外の縦書き「ご注文はこちらから」や「※…」の注意書きは入れない）
-        for l in blk:
+        for j_, l in enumerate(blk):
             if id(l) not in assign or _band_of(l) is not None:
                 continue
             yc_ = (l["y0"] + l["y1"]) / 2
             out_by = min(min(abs(yc_ - (c_ - h / 2)), abs(yc_ - (c_ + h / 2))) for c_ in cs)
-            if abs(l["x0"] - menu_x) > 3 or l["t"].strip().startswith(("※", "*", "＊")) or out_by > h * 0.25:
+            # 字下げした2行目（例：「こだわりの逸品：」の下にそろえた「ゆで豚ともやしの塩だれ冷菜」）は、
+            # 前の行のすぐ下に続いていれば、左端がずれていてもその日の分とみなす
+            prev_l = blk[j_ - 1] if j_ > 0 else None
+            follows = (prev_l is not None and l["x0"] >= menu_x - 3
+                       and l["y0"] - prev_l["y1"] < max(prev_l["y1"] - prev_l["y0"], 4) * 0.8)
+            if (abs(l["x0"] - menu_x) > 3 and not follows) or l["t"].strip().startswith(("※", "*", "＊")) or out_by > h * 0.25:
                 del assign[id(l)]
 
     days = []
@@ -2493,7 +2504,7 @@ def run_checks(pdf: PdfDoc, masters: dict, fax: list, cfg: Config, stores: Optio
         add("高", CAT7, None, "", "注文欄の見出し（年月）", got_h, exp_h,
             f"ファイル名の掲載期間からすると「{exp_h}」のはずですが、注文欄の見出しが「{got_h}」になっています")
         mark(CAT7, False)
-    if pdf.days:
+    if pdf.days and pdf.days[0].date and pdf.days[-1].date:  # 読めない日付があっても止まらないように
         first, last = pdf.days[0].date, pdf.days[-1].date
         if pdf.period:
             _, ps, pe = pdf.period
@@ -3000,4 +3011,4 @@ def main():
                 show_result(r)
 
 
-main()
+main()
